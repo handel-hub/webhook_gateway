@@ -18,7 +18,9 @@ export const DeliveriesRepo = {
       `SELECT id, event_id, application_id, destination_endpoint_id, status,
               attempt_count, fencing_token, first_attempt_at, last_attempt_at,
               next_attempt_at, claimed_by_worker as leased_by, lease_expires_at,
-              delivered_at, dead_lettered_at, terminal_reason, created_at, updated_at
+              delivered_at, dead_lettered_at, terminal_reason,
+              epoch_id, epoch_attempt_count, redrive_count, horizon_started_at,
+              created_at, updated_at
        FROM cwids.event_deliveries
        WHERE id = $1`,
       [id],
@@ -29,22 +31,30 @@ export const DeliveriesRepo = {
   },
 
   /**
-   * Redrives a dead-lettered delivery back to pending status, incrementing fencing token.
+   * Redrives a dead-lettered delivery back to pending status with a new epoch, incrementing fencing token.
+   * Monotonic attempt_count is preserved to prevent delivery_attempts key collision.
+   *
    * @param {pg.PoolClient} client
    * @param {string} deliveryId
-   * @returns {Promise<{ id: string, event_id: string, application_id: string, destination_endpoint_id: string, status: string, attempt_count: number, fencing_token: number, next_attempt_at: Date } | null>}
+   * @returns {Promise<{ id: string, event_id: string, application_id: string, destination_endpoint_id: string, status: string, attempt_count: number, fencing_token: number, next_attempt_at: Date, epoch_id: string, epoch_attempt_count: number, redrive_count: number, horizon_started_at: Date } | null>}
    */
   async redriveDelivery(client, deliveryId) {
     const res = await client.query(
       `UPDATE cwids.event_deliveries
        SET status = 'pending',
-           fencing_token = fencing_token + 1,
+           epoch_id = gen_random_uuid(),
+           epoch_attempt_count = 0,
+           redrive_count = redrive_count + 1,
+           horizon_started_at = CURRENT_TIMESTAMP,
            next_attempt_at = CURRENT_TIMESTAMP,
+           fencing_token = fencing_token + 1,
            lease_expires_at = NULL,
+           terminal_reason = NULL,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $1 AND status = 'dead_lettered'
        RETURNING id, event_id, application_id, destination_endpoint_id, status,
-                 attempt_count, fencing_token, next_attempt_at`,
+                 attempt_count, fencing_token, next_attempt_at,
+                 epoch_id, epoch_attempt_count, redrive_count, horizon_started_at`,
       [deliveryId],
     );
     return res.rows[0] ?? null;
@@ -64,13 +74,17 @@ export const DeliveriesRepo = {
   async insertDelivery(client, data) {
     const res = await client.query(
       `INSERT INTO cwids.event_deliveries
-         (id, event_id, application_id, destination_endpoint_id, status, next_attempt_at)
+         (id, event_id, application_id, destination_endpoint_id, status, next_attempt_at,
+          epoch_id, epoch_attempt_count, redrive_count, horizon_started_at)
        VALUES
-         (COALESCE($1, gen_random_uuid()), $2, $3, $4, 'pending', CURRENT_TIMESTAMP)
+         (COALESCE($1, gen_random_uuid()), $2, $3, $4, 'pending', CURRENT_TIMESTAMP,
+          gen_random_uuid(), 0, 0, CURRENT_TIMESTAMP)
        RETURNING id, event_id, application_id, destination_endpoint_id, status,
                  attempt_count, fencing_token, first_attempt_at, last_attempt_at,
                  next_attempt_at, claimed_by_worker as leased_by, lease_expires_at,
-                 delivered_at, dead_lettered_at, terminal_reason, created_at, updated_at`,
+                 delivered_at, dead_lettered_at, terminal_reason,
+                 epoch_id, epoch_attempt_count, redrive_count, horizon_started_at,
+                 created_at, updated_at`,
       [data.id ?? null, data.eventId, data.applicationId, data.destinationEndpointId],
     );
     /** @type {EventDeliveryRecord[]} */
@@ -208,6 +222,7 @@ export const DeliveriesRepo = {
        SET status = 'retry_scheduled',
            next_attempt_at = $3,
            attempt_count = attempt_count + 1,
+           epoch_attempt_count = epoch_attempt_count + 1,
            last_http_status = $4,
            last_error_code = $5,
            lease_expires_at = NULL,
@@ -233,6 +248,8 @@ export const DeliveriesRepo = {
       `UPDATE cwids.event_deliveries
        SET status = 'dead_lettered',
            terminal_reason = $3,
+           attempt_count = attempt_count + 1,
+           epoch_attempt_count = epoch_attempt_count + 1,
            last_http_status = $4,
            last_error_code = $5,
            dead_lettered_at = CURRENT_TIMESTAMP,

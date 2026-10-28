@@ -148,10 +148,12 @@ export const DeliveryService = {
       // Evaluate retry policy
       const retryDecision = evaluateRetry({
         firstAttemptAt: claim.firstAttemptAt,
+        horizonStartedAt: claim.horizonStartedAt ?? null,
         attemptCount: claim.attemptCount + 1,
+        epochAttemptCount: (claim.epochAttemptCount ?? 0) + 1,
         httpStatus: dispatchResult.httpStatus,
         errorCode: dispatchResult.errorCode,
-        maxRetries: endpoint.max_retries ?? 15,
+        maxRetries: Math.min(endpoint.max_retries ?? 50, 50),
       });
 
       if (retryDecision.shouldRetry && retryDecision.nextAttemptAt) {

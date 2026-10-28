@@ -327,6 +327,10 @@ export function createAdminRouter({ pool, adminApiToken }) {
           fencing_token: redriveResult.updated.fencing_token,
           attempt_count: redriveResult.updated.attempt_count,
           next_attempt_at: redriveResult.updated.next_attempt_at,
+          epoch_id: redriveResult.updated.epoch_id,
+          epoch_attempt_count: redriveResult.updated.epoch_attempt_count,
+          redrive_count: redriveResult.updated.redrive_count,
+          horizon_started_at: redriveResult.updated.horizon_started_at,
           redrive_audit_id: redriveResult.auditEventId,
         });
       } finally {

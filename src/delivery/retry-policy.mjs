@@ -35,22 +35,26 @@ export function isRetryableFailure(httpStatus, errorCode = null) {
  * Computes retry decision using 72-hour exponential backoff with full jitter (ADR-08).
  *
  * @param {object} params
- * @param {Date | null} params.firstAttemptAt - Timestamp when the delivery was first attempted.
+ * @param {Date | null} [params.firstAttemptAt] - Timestamp when the delivery was first attempted.
+ * @param {Date | null} [params.horizonStartedAt] - Timestamp when current 72h epoch started.
  * @param {number} params.attemptCount - Number of prior attempts made.
+ * @param {number} [params.epochAttemptCount] - Prior attempts within current epoch.
  * @param {number} params.httpStatus - Last HTTP status code returned.
  * @param {string | null} [params.errorCode=null] - System error code if socket failed.
- * @param {number} [params.maxRetries=15] - Maximum permitted attempt count.
+ * @param {number} [params.maxRetries=50] - Maximum permitted attempt count.
  * @param {number} [params.initialDelayMs=30000] - Base delay in milliseconds (30s).
  * @param {number} [params.maxDelayMs=7200000] - Maximum delay ceiling (2 hours).
  * @param {number} [params.horizonMs=259200000] - Absolute cutoff horizon (72 hours).
  * @returns {RetryDecision}
  */
 export function evaluateRetry({
-  firstAttemptAt,
+  firstAttemptAt = null,
+  horizonStartedAt = null,
   attemptCount,
+  epochAttemptCount,
   httpStatus,
   errorCode = null,
-  maxRetries = 15,
+  maxRetries = 50,
   initialDelayMs = LIMITS.DEFAULT_INITIAL_BACKOFF_SECONDS * 1000,
   maxDelayMs = LIMITS.MAX_BACKOFF_DELAY_MS,
   horizonMs = LIMITS.MAX_RETRY_HORIZON_MS,
@@ -67,12 +71,10 @@ export function evaluateRetry({
     };
   }
 
-  const now = Date.now();
-  const baselineTime = firstAttemptAt ? new Date(firstAttemptAt).getTime() : now;
-  const horizonCutoff = baselineTime + horizonMs;
+  const effectiveAttemptCount = epochAttemptCount ?? attemptCount;
 
   // Max retry count exhausted
-  if (attemptCount >= maxRetries) {
+  if (effectiveAttemptCount >= maxRetries) {
     return {
       shouldRetry: false,
       nextAttemptAt: null,
@@ -81,14 +83,32 @@ export function evaluateRetry({
     };
   }
 
-  // Calculate exponential delay: initialDelay * 2^attemptCount
-  const rawDelay = initialDelayMs * Math.pow(LIMITS.DEFAULT_BACKOFF_MULTIPLIER, attemptCount);
+  const now = Date.now();
+  const baselineTime = horizonStartedAt
+    ? new Date(horizonStartedAt).getTime()
+    : firstAttemptAt
+      ? new Date(firstAttemptAt).getTime()
+      : now;
+  const horizonCutoff = baselineTime + horizonMs;
+
+  if (now >= horizonCutoff) {
+    return {
+      shouldRetry: false,
+      nextAttemptAt: null,
+      isDeadLetter: true,
+      terminalReason: 'HORIZON_EXHAUSTED',
+    };
+  }
+
+  // Calculate exponential delay: initialDelay * 2^effectiveAttemptCount
+  const rawDelay = initialDelayMs * Math.pow(LIMITS.DEFAULT_BACKOFF_MULTIPLIER, effectiveAttemptCount);
   const cappedDelay = Math.min(rawDelay, maxDelayMs);
 
-  // Apply full jitter: ±20% randomization
+  // Apply jitter: ±20% randomization with 5s floor (1s if delay < 5s)
   const jitterRange = cappedDelay * LIMITS.DEFAULT_BACKOFF_JITTER_RATIO;
   const jitter = (Math.random() * 2 - 1) * jitterRange;
-  const jitteredDelayMs = Math.max(1000, Math.round(cappedDelay + jitter));
+  const minFloor = cappedDelay < 5000 ? 1000 : 5000;
+  const jitteredDelayMs = Math.max(minFloor, Math.round(cappedDelay + jitter));
 
   const scheduledNextAttempt = now + jitteredDelayMs;
 
