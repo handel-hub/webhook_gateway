@@ -1,0 +1,32 @@
+{
+  "name": "webhook_gateway",
+  "version": "1.0.0",
+  "description": "Centralized Webhook Ingestion and Delivery Service (CWIDS)",
+  "main": "src/index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "start:gateway": "node src/server.js",
+    "start:worker": "node src/worker.js",
+    "migrate": "node src/db/migrate.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "webhook",
+    "gateway",
+    "ingestion",
+    "delivery",
+    "cwids",
+    "postgresql"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}
