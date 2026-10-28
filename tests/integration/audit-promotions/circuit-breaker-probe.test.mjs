@@ -21,11 +21,13 @@ test('Circuit Breaker Probe: half_open endpoints permit exactly 1 concurrent pro
     return;
   }
 
+  /** @type {any} */
+  let endp;
   try {
     await client.query('SET search_path TO cwids, public;');
 
     // Find an active endpoint
-    const endp = (await client.query('SELECT id, application_id FROM destination_endpoints LIMIT 1')).rows[0];
+    endp = (await client.query('SELECT id, application_id FROM destination_endpoints LIMIT 1')).rows[0];
     if (!endp) {
       t.skip('No destination endpoint seeded. Skipping.');
       return;
@@ -46,6 +48,13 @@ test('Circuit Breaker Probe: half_open endpoints permit exactly 1 concurrent pro
     // Assert that when probe is in flight, ZERO new claims are granted for this endpoint
     assert.equal(endpointClaims.length, 0, 'No claims should be granted when half_open probe is already in flight.');
   } finally {
+    if (endp) {
+      await client.query(`
+        UPDATE circuit_breaker_states
+        SET state = 'closed', half_open_probe_in_flight = false
+        WHERE destination_endpoint_id = $1;
+      `, [endp.id]);
+    }
     await client.end();
   }
 });

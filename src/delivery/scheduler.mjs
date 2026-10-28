@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { LeaseManager } from './lease-manager.mjs';
+import { CircuitBreaker } from './circuit-breaker.mjs';
 import { LIMITS } from '../config/limits.mjs';
 import { logger } from '../observability/logger.mjs';
 
@@ -98,7 +99,7 @@ export class DeliveryScheduler {
   }
 
   /**
-   * Periodically recovers expired leases from crashed workers every 60 seconds.
+   * Periodically recovers expired leases and sweeps matured circuit breakers every 60 seconds.
    */
   scheduleRecoverySweep() {
     this.recoveryTimer = setInterval(async () => {
@@ -107,6 +108,16 @@ export class DeliveryScheduler {
         await LeaseManager.recoverExpiredLeases(this.pool);
       } catch (err) {
         logger.error('Error in periodic lease recovery sweep', err instanceof Error ? err : new Error(String(err)));
+      }
+      try {
+        const client = await this.pool.connect();
+        try {
+          await CircuitBreaker.sweepCooldowns(client);
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        logger.error('Error in circuit breaker cooldown sweep', err instanceof Error ? err : new Error(String(err)));
       }
     }, 60000);
   }

@@ -28,6 +28,14 @@ test('Fenced Stale Worker: Stale worker update returns false on token mismatch a
     const endp = (await client.query('SELECT id FROM destination_endpoints WHERE application_id = $1 LIMIT 1', [app.id])).rows[0];
     const conn = (await client.query('SELECT id, provider, environment FROM provider_connections LIMIT 1')).rows[0];
 
+    // Ensure circuit breaker is closed
+    await client.query(`
+      INSERT INTO circuit_breaker_states (destination_endpoint_id, state, consecutive_failures, half_open_probe_in_flight)
+      VALUES ($1, 'closed', 0, false)
+      ON CONFLICT (destination_endpoint_id) DO UPDATE
+      SET state = 'closed', consecutive_failures = 0, half_open_probe_in_flight = false;
+    `, [endp.id]);
+
     // Insert an event and delivery
     const ev = (await client.query(`
       INSERT INTO webhook_events (application_id, provider_connection_id, provider, environment, identity_strategy_version, dedupe_key, event_type, resource_type, resource_reference, routing_status, routing_mode, kek_version, payload_sha256)
@@ -37,7 +45,7 @@ test('Fenced Stale Worker: Stale worker update returns false on token mismatch a
 
     const deliv = (await client.query(`
       INSERT INTO event_deliveries (event_id, application_id, destination_endpoint_id, status, next_attempt_at)
-      VALUES ($1, $2, $3, 'pending', NOW())
+      VALUES ($1, $2, $3, 'pending', NOW() - INTERVAL '1 hour')
       RETURNING id, fencing_token;
     `, [ev.id, app.id, endp.id])).rows[0];
 

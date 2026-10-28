@@ -2,6 +2,7 @@ import { getEnv } from './config/env.mjs';
 import { getWorkerPool, closeAllPools } from './db/pool.mjs';
 import { DeliveryScheduler } from './delivery/scheduler.mjs';
 import { DeliveryService } from './delivery/delivery-service.mjs';
+import { CircuitBreakerSweeper } from './delivery/circuit-breaker.mjs';
 import { AuditExporter } from './maintenance/audit-exporter.mjs';
 import { IntentCleanupWorker } from './maintenance/intent-cleanup.mjs';
 import { RetentionWorker } from './maintenance/retention-worker.mjs';
@@ -38,6 +39,7 @@ export async function startWorker() {
   const intentCleanup = IntentCleanupWorker.startWorker(pool, { intervalMs: 3600000 });
   const retentionWorker = RetentionWorker.startWorker(pool, { intervalMs: 86400000 });
   const reconciliationWorker = ReconciliationWorker.startWorker(pool, env);
+  const circuitSweeper = CircuitBreakerSweeper.startSweeper(pool, { intervalMs: 10000 });
 
   // 3. Start scheduler polling loop
   scheduler.start();
@@ -54,6 +56,7 @@ export async function startWorker() {
     intentCleanup.stop();
     retentionWorker.stop();
     reconciliationWorker.stop();
+    circuitSweeper.stop();
 
     // Drain and stop scheduler
     await scheduler.stop(30000);

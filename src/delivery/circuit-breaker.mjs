@@ -135,4 +135,58 @@ export const CircuitBreaker = {
 
     return newState;
   },
+
+  /**
+   * Sweeps circuit breakers in 'open' state whose cooldown has elapsed,
+   * transitioning them to 'half_open' with half_open_probe_in_flight = false.
+   *
+   * @param {pg.PoolClient} client
+   * @param {number} [cooldownSeconds=120]
+   * @returns {Promise<number>} Number of circuit breakers transitioned.
+   */
+  async sweepCooldowns(client, cooldownSeconds = 120) {
+    const res = await client.query(
+      `UPDATE cwids.circuit_breaker_states
+       SET state = 'half_open',
+           half_open_probe_in_flight = false,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE state = 'open'
+         AND opened_at + make_interval(secs => $1) <= CURRENT_TIMESTAMP`,
+      [cooldownSeconds],
+    );
+    return res.rowCount ?? 0;
+  },
 };
+
+/**
+ * Background worker that periodically sweeps matured open circuit breakers into half_open.
+ */
+export class CircuitBreakerSweeper {
+  /**
+   * Starts periodic circuit breaker cooldown sweeper.
+   * @param {pg.Pool} pool
+   * @param {object} [options]
+   * @param {number} [options.intervalMs=10000]
+   * @param {number} [options.cooldownSeconds=120]
+   * @returns {{ stop: () => void }}
+   */
+  static startSweeper(pool, { intervalMs = 10000, cooldownSeconds = 120 } = {}) {
+    const timer = setInterval(async () => {
+      try {
+        const client = await pool.connect();
+        try {
+          await CircuitBreaker.sweepCooldowns(client, cooldownSeconds);
+        } finally {
+          client.release();
+        }
+      } catch {
+        // Suppress background sweeper transient errors
+      }
+    }, intervalMs);
+    timer.unref();
+
+    return {
+      stop: () => clearInterval(timer),
+    };
+  }
+}

@@ -2,6 +2,7 @@ import pg from 'pg';
 import { CircuitBreaker } from './circuit-breaker.mjs';
 import { EventsRepo } from '../db/repositories/events-repo.mjs';
 import { DeliveriesRepo } from '../db/repositories/deliveries-repo.mjs';
+import { LeaseManager } from './lease-manager.mjs';
 import { AttemptsRepo } from '../db/repositories/attempts-repo.mjs';
 import { decryptPayloadEnvelope } from '../security/crypto-envelope.mjs';
 import { dispatchWebhook } from './http-dispatcher.mjs';
@@ -109,28 +110,30 @@ export const DeliveryService = {
     const durationMs = finishedAt.getTime() - startedAt.getTime();
     const isSuccess = dispatchResult.httpStatus >= 200 && dispatchResult.httpStatus < 300;
 
-    // 4. Update Database inside transaction enforcing fencing token match
+    // 4. Update Database inside transaction enforcing fencing token match FIRST before auditing attempt
     return withTransaction(pool, claim.applicationId, async (client) => {
-      // Record immutable delivery attempt audit
-      await AttemptsRepo.recordAttempt(client, {
-        deliveryId: claim.deliveryId,
-        attemptNumber: claim.attemptCount + 1,
-        fencingToken: claim.fencingToken,
-        startedAt,
-        finishedAt,
-        durationMs,
-        httpStatus: dispatchResult.httpStatus,
-        responseStatus: dispatchResult.responseStatus,
-        responseExcerpt: dispatchResult.responseExcerpt,
-        isTruncated: dispatchResult.isTruncated,
-        errorCode: dispatchResult.errorCode,
-        errorMessage: dispatchResult.errorMessage,
-        workerIdentity,
-      });
-
       if (isSuccess) {
-        await DeliveriesRepo.completeDelivery(client, claim.deliveryId, claim.fencingToken);
+        // Enforce monotonic fencing token match FIRST
+        await LeaseManager.completeFenced(client, claim.deliveryId, claim.fencingToken);
         await CircuitBreaker.recordSuccess(client, claim.destinationEndpointId);
+
+        // Record attempt only after successful fenced write
+        await AttemptsRepo.recordAttempt(client, {
+          deliveryId: claim.deliveryId,
+          attemptNumber: claim.attemptCount + 1,
+          fencingToken: claim.fencingToken,
+          startedAt,
+          finishedAt,
+          durationMs,
+          httpStatus: dispatchResult.httpStatus,
+          responseStatus: dispatchResult.responseStatus,
+          responseExcerpt: dispatchResult.responseExcerpt,
+          isTruncated: dispatchResult.isTruncated,
+          errorCode: dispatchResult.errorCode,
+          errorMessage: dispatchResult.errorMessage,
+          workerIdentity,
+        });
+
         logger.info('Delivery successfully completed', {
           deliveryId: claim.deliveryId,
           attempt: claim.attemptCount + 1,
@@ -152,7 +155,8 @@ export const DeliveryService = {
       });
 
       if (retryDecision.shouldRetry && retryDecision.nextAttemptAt) {
-        await DeliveriesRepo.scheduleRetry(
+        // Enforce monotonic fencing token match FIRST
+        await LeaseManager.retryFenced(
           client,
           claim.deliveryId,
           claim.fencingToken,
@@ -160,6 +164,24 @@ export const DeliveryService = {
           dispatchResult.httpStatus,
           dispatchResult.errorCode,
         );
+
+        // Record attempt only after successful fenced write
+        await AttemptsRepo.recordAttempt(client, {
+          deliveryId: claim.deliveryId,
+          attemptNumber: claim.attemptCount + 1,
+          fencingToken: claim.fencingToken,
+          startedAt,
+          finishedAt,
+          durationMs,
+          httpStatus: dispatchResult.httpStatus,
+          responseStatus: dispatchResult.responseStatus,
+          responseExcerpt: dispatchResult.responseExcerpt,
+          isTruncated: dispatchResult.isTruncated,
+          errorCode: dispatchResult.errorCode,
+          errorMessage: dispatchResult.errorMessage,
+          workerIdentity,
+        });
+
         logger.warn('Delivery scheduled for retry', {
           deliveryId: claim.deliveryId,
           nextAttemptAt: retryDecision.nextAttemptAt.toISOString(),
@@ -167,7 +189,8 @@ export const DeliveryService = {
         });
         return { status: 'retry_scheduled' };
       } else {
-        await DeliveriesRepo.deadLetterDelivery(
+        // Enforce monotonic fencing token match FIRST
+        await LeaseManager.deadLetterFenced(
           client,
           claim.deliveryId,
           claim.fencingToken,
@@ -175,6 +198,24 @@ export const DeliveryService = {
           dispatchResult.httpStatus,
           dispatchResult.errorCode,
         );
+
+        // Record attempt only after successful fenced write
+        await AttemptsRepo.recordAttempt(client, {
+          deliveryId: claim.deliveryId,
+          attemptNumber: claim.attemptCount + 1,
+          fencingToken: claim.fencingToken,
+          startedAt,
+          finishedAt,
+          durationMs,
+          httpStatus: dispatchResult.httpStatus,
+          responseStatus: dispatchResult.responseStatus,
+          responseExcerpt: dispatchResult.responseExcerpt,
+          isTruncated: dispatchResult.isTruncated,
+          errorCode: dispatchResult.errorCode,
+          errorMessage: dispatchResult.errorMessage,
+          workerIdentity,
+        });
+
         logger.error(
           'Delivery transitioned to dead_lettered',
           undefined,
