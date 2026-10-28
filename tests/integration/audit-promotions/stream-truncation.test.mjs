@@ -4,6 +4,7 @@ import http from 'node:http';
 import { dispatchWebhook } from '../../../src/delivery/http-dispatcher.mjs';
 
 test('Stream Truncation: 50MB response stream severs immediately in <1000ms and resolves cleanly', { timeout: 1000 }, async (t) => {
+  /** @type {NodeJS.Timeout | null} */
   let interval = null;
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Connection': 'close' });

@@ -148,6 +148,7 @@ export const IntentsRepo = {
    * @param {pg.PoolClient} client
    * @param {{
    *   paymentIntentId: string,
+   *   applicationId?: string,
    *   providerConnectionId: string,
    *   environment: string,
    *   aliasType: string,
@@ -158,11 +159,12 @@ export const IntentsRepo = {
   async createAlias(client, data) {
     await client.query(
       `INSERT INTO cwids.payment_intent_aliases
-         (payment_intent_id, provider_connection_id, environment, alias_type, alias_value)
-       VALUES ($1, $2, $3, $4, $5)
+         (payment_intent_id, application_id, provider_connection_id, environment, alias_type, alias_value)
+       VALUES ($1, COALESCE($2, (SELECT application_id FROM cwids.payment_intent_correlations WHERE id = $1)), $3, $4, $5, $6)
        ON CONFLICT (provider_connection_id, environment, alias_type, alias_value) DO NOTHING`,
       [
         data.paymentIntentId,
+        data.applicationId ?? null,
         data.providerConnectionId,
         data.environment,
         data.aliasType,

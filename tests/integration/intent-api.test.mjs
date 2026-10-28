@@ -67,7 +67,7 @@ function createMockPool() {
       }
 
       // Find intent by ID
-      if (s.includes('FROM CWIDS.PAYMENT_INTENT_CORRELATIONS') && s.includes('WHERE ID = $1')) {
+      if (s.startsWith('SELECT') && s.includes('FROM CWIDS.PAYMENT_INTENT_CORRELATIONS') && s.includes('WHERE ID = $1')) {
         const id = params[0];
         const record = intentsById.get(id);
         return { rows: record ? [record] : [] };
@@ -121,12 +121,13 @@ function createMockPool() {
 
       // Insert alias
       if (s.includes('INSERT INTO CWIDS.PAYMENT_INTENT_ALIASES')) {
+        const hasAppId = params.length === 6;
         aliases.push({
           paymentIntentId: params[0],
-          providerConnectionId: params[1],
-          environment: params[2],
-          aliasType: params[3],
-          aliasValue: params[4],
+          providerConnectionId: hasAppId ? params[2] : params[1],
+          environment: hasAppId ? params[3] : params[2],
+          aliasType: hasAppId ? params[4] : params[3],
+          aliasValue: hasAppId ? params[5] : params[4],
         });
         return { rows: [] };
       }
