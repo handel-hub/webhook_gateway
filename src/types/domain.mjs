@@ -85,7 +85,7 @@
  * @property {string} id - UUID
  * @property {string} code
  * @property {string} name
- * @property {string} status - 'active' | 'suspended' | 'disabled' | 'retired'
+ * @property {'pending' | 'active' | 'suspended' | 'disabled' | 'retired'} status
  * @property {string} api_key_hash
  * @property {Date} created_at
  * @property {Date} updated_at
@@ -112,7 +112,12 @@
  * @property {string} application_id - UUID
  * @property {number} version
  * @property {string} url
- * @property {string} signing_secret
+ * @property {string | null} signing_secret
+ * @property {Buffer | null} [encrypted_signing_secret]
+ * @property {Buffer | null} [secret_nonce]
+ * @property {Buffer | null} [secret_tag]
+ * @property {string} [secret_kek_version]
+ * @property {'envelope' | 'http_status'} response_validation_mode
  * @property {number} http_timeout_ms
  * @property {number} max_retries
  * @property {string} status

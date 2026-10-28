@@ -18,6 +18,10 @@
  * @property {number} fencingToken - Monotonically incremented fencing generation token.
  * @property {Date | null} firstAttemptAt - Timestamp of first attempt.
  * @property {Date} leaseExpiresAt - Database lease expiration timestamp.
+ * @property {string} [epochId] - Current delivery epoch UUID.
+ * @property {number} [epochAttemptCount] - Attempt count within current epoch.
+ * @property {number} [redriveCount] - Number of times redriven.
+ * @property {Date} [horizonStartedAt] - Epoch start timestamp for 72h window.
  */
 
 /**
@@ -64,6 +68,10 @@
  * @property {Date | null} delivered_at
  * @property {Date | null} dead_lettered_at
  * @property {string | null} terminal_reason
+ * @property {string} [epoch_id]
+ * @property {number} [epoch_attempt_count]
+ * @property {number} [redrive_count]
+ * @property {Date} [horizon_started_at]
  * @property {Date} created_at
  * @property {Date} updated_at
  */
