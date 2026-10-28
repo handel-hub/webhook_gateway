@@ -120,11 +120,16 @@ The implementation plan is designed to satisfy 100% of the requirements catalogu
 2. **PostgreSQL Availability:** PostgreSQL 15+ is available with `pgcrypto` and `uuid-ossp` extensions enabled.
 3. **Database Client:** The `pg` driver is used directly with explicit, parameterized SQL queries. An ORM is strictly prohibited.
 
-### Unresolved Owner Decisions (Non-Blocking)
-The following decisions from Section 55 of the technical specification require project owner approval before production deployment, but do NOT block phase-by-phase implementation:
-1. **Hosting Profile:** Profile A (Single-host VPS, RPO 15m / RTO 2h) vs. Profile B (Multi-AZ Managed DB, RPO <1m / RTO 60s). *Implementation Assumption:* Code is written identically for both profiles.
-2. **Reconciliation Provider Credentials:** Custody of provider REST API keys. *Implementation Assumption:* Core transport and local reconciliation are built first; provider REST verification is encapsulated in an isolated module.
-3. **Data Retention Horizon:** Payload retention defaults to 30 days, metadata to 90 days, audits to 7 years. *Implementation Assumption:* Tunable via environment variables.
+### Formally Approved Project Owner Decisions (Integrated into Baseline)
+The following decisions have been explicitly approved by the project owner and are incorporated as binding architectural requirements:
+1. **Automated Provider Reconciliation (ADR-11):** Supported as an optional, independently configurable background capability. Kept strictly behind provider-specific adapters; does NOT block webhook ingestion, delivery, or persistence. Operates with bounded execution (concurrency limits, request timeouts, rate limiting, exponential backoff) using trusted correlation records. Never triggers automatic downstream fulfillment or silences discrepancies; reports evidence for controlled downstream review. Disabled by default.
+2. **Encrypted Payload and Metadata Retention (ADR-12):**
+   - **Encrypted Raw Webhook Payloads:** Default retention is **30 days** (configurable). Expired payloads are pruned via a reliable batch retention job while retaining normalized metadata, delivery records, and foreign key relationships. Explicit legal hold exceptions (`legal_hold = true`) preserve payloads indefinitely during active investigations.
+   - **Normalized Event Metadata:** Default retention is **90 days** (configurable), preserving event identification, routing history, and foreign keys.
+   - **Administrative Audit Events:** Universal seven-year retention is explicitly rejected. Audit events are classified by purpose (`audit_class IN ('security', 'operational', 'compliance')`). Security/compliance audits default to 7 years (2,555 days) where justified; operational audits default to 365 days. All retention and deletion operations are themselves fully audited.
+
+### Remaining Operational Decisions (Non-Blocking)
+1. **Hosting Profile Selection:** Profile A (Single-host VPS with continuous WAL archiving to S3, RPO 15m / RTO 2h) is targeted for development and initial rollout; Profile B (Multi-AZ Managed DB with synchronous replication, RPO <1m / RTO 60s) requires final owner sign-off prior to high-volume financial traffic. Code and schema remain 100% identical under both profiles.
 
 ---
 
@@ -270,8 +275,9 @@ webhook_gateway/
 │   │   └── audit-service.mjs               # Administrative audit service
 │   ├── maintenance/
 │   │   ├── intent-cleanup.mjs              # Expired intent batch deletion worker
+│   │   ├── retention-worker.mjs            # Centralized payload (30d) and metadata (90d) pruner
 │   │   ├── audit-exporter.mjs              # Transactional outbox log sink exporter
-│   │   └── reconciliation-worker.mjs       # Scheduled payment reconciliation engine
+│   │   └── reconciliation-worker.mjs       # Optional scheduled provider reconciliation engine
 │   └── observability/
 │       ├── logger.mjs                      # Structured JSON logger with redaction
 │       └── metrics.mjs                     # Prometheus metrics registry (/metrics)
@@ -320,6 +326,9 @@ The following matrix documents the single primary responsibility, prohibited imp
 | `src/delivery/http-dispatcher.mjs` | Dispatch outbound callbacks with 2KB streaming limit | Lease management; DB transactions | `node:https`, `src/security/ssrf-agent.mjs`| Database transactions | Phase 9 |
 | `src/delivery/retry-policy.mjs` | Compute 72h exponential backoff with full jitter | Database updates; network calls | `src/types/delivery.mjs` | `pg`, Repositories | Phase 10 |
 | `src/admin/internal-api.mjs` | REST endpoint for payment intent registration | Inbound webhook verification | Repositories, Express | Outbound HTTP delivery | Phase 11 |
+| `src/maintenance/retention-worker.mjs` | Prune expired encrypted payloads (30d) and metadata (90d) with legal hold checks | Business status changes; payload decryption | Repositories, `src/config/limits.mjs` | Inbound Ingress, Delivery worker | Phase 11 |
+| `src/maintenance/reconciliation-worker.mjs` | Optional background reconciliation querying provider APIs via adapters | Webhook ingestion; direct downstream fulfillment | Repositories, Provider adapters | Express, Ingress Gateway | Phase 11 |
+| `src/providers/*/reconciliation.mjs` | Provider-specific REST transaction verification queries | Ingestion signature verification; database writes | `node:https`, `src/types/provider.mjs` | `src/db/*`, Repositories | Phase 11 |
 
 ---
 
@@ -575,12 +584,13 @@ CWIDS manages database evolution through versioned, repeatable SQL migration fil
   - `provider_connections`: Provider accounts, environments, and KMS credentials.
   - `payment_intent_correlations`: Mode A routing intent records.
   - `payment_intent_aliases`: Mode C dynamic aliases (`virtual_account_id`, `provider_reference`).
-  - `webhook_events`: Authoritative event store with AES-256-GCM ciphertext columns.
+  - `webhook_events`: Authoritative event store with AES-256-GCM ciphertext columns, `payload_deleted_at TIMESTAMPTZ` for 30d payload pruning, and `legal_hold BOOLEAN NOT NULL DEFAULT FALSE`.
   - `event_deliveries`: Durable work queue with `fencing_token` and leases.
   - `delivery_attempts`: Append-only attempt history with 2KB response excerpt.
   - `circuit_breaker_states`: Per-destination circuit breaker state.
-  - `administrative_audit_events`: Tamper-evident operational audit trail.
+  - `administrative_audit_events`: Tamper-evident operational audit trail with `audit_class TEXT NOT NULL DEFAULT 'operational' CHECK (audit_class IN ('security', 'operational', 'compliance'))` and `legal_hold BOOLEAN NOT NULL DEFAULT FALSE`.
   - `audit_outbox`: Transactional outbox for remote audit export.
+  - `reconciliation_records`: Stores provider API verification results, discrepancies, matching status (`matched`, `discrepancy_detected`, `quarantined`, `resolved`), and verified transaction attributes.
 - **Enforces Constraints:**
   - `uq_webhook_events_dedupe` on `(provider_connection_id, environment, identity_strategy_version, dedupe_key)`.
   - `uq_intent_merchant_ref` on `(provider_connection_id, environment, merchant_reference)`.
@@ -597,6 +607,9 @@ CWIDS manages database evolution through versioned, repeatable SQL migration fil
   - `idx_event_deliveries_claimable` ON `event_deliveries(next_attempt_at, id) WHERE status IN ('pending', 'retry_scheduled')`.
   - `idx_event_deliveries_leases` ON `event_deliveries(lease_expires_at) WHERE status = 'in_flight'`.
   - `idx_intent_cleanup` ON `payment_intent_correlations(expires_at, id) WHERE status IN ('active', 'expired')`.
+  - `idx_webhook_events_payload_cleanup` ON `webhook_events(received_at, id) WHERE encrypted_payload IS NOT NULL AND legal_hold = FALSE`.
+  - `idx_webhook_events_metadata_cleanup` ON `webhook_events(received_at, id) WHERE legal_hold = FALSE`.
+  - `idx_audit_events_cleanup` ON `administrative_audit_events(created_at, audit_class) WHERE legal_hold = FALSE`.
 - Configures aggressive autovacuum thresholds on `event_deliveries` (`scale_factor = 0.05`).
 
 ### 15.2 Migration Execution Protocol (`src/db/migrate.mjs`)
@@ -1047,21 +1060,27 @@ The construction of CWIDS is structured into 15 dependency-ordered phases (Phase
 
 ---
 
-### Phase 11: Administrative APIs, Controlled Replay, Audit Outbox & Intent API
-- **Objective:** Construct the internal payment-intent registration API, administrative management endpoints, and audit outbox exporter.
-- **Why at this point:** Enables applications to register intents and allows operators to redrive failed deliveries safely.
+### Phase 11: Administrative APIs, Controlled Replay, Classified Retention & Optional Reconciliation
+- **Objective:** Construct the internal payment-intent registration API, administrative management endpoints, audit outbox exporter, centralized data retention engine, and optional provider reconciliation worker.
+- **Why at this point:** Enables applications to register intents, allows operators to redrive failed deliveries safely, enforces legal data retention limits, and provides optional provider API reconciliation.
 - **Prerequisites:** Phase 4 repositories, Phase 7 ingestion, Phase 10 retry engine.
-- **Architectural Decisions Required:** GAP-01 (Intent Registration API), GAP-06 (Audit outbox export), FR-012 (Controlled redrive).
+- **Architectural Decisions Required:** GAP-01 (Intent Registration API), GAP-06 (Audit outbox export), FR-012 (Controlled redrive), ADR-11 (Optional Automated Provider Reconciliation), ADR-12 (Centralized Data Retention & Classification).
 - **Exact Files Affected:**
   - `src/admin/internal-api.mjs` [NEW]: Express router for `POST /v1/internal/payment-intents`.
   - `src/admin/admin-server.mjs` [NEW]: Privileged administrative API router (`/v1/admin/*`).
   - `src/admin/audit-service.mjs` [NEW]: Records privileged changes and queues outbox events.
   - `src/maintenance/audit-exporter.mjs` [NEW]: Worker draining `audit_outbox` to stdout/syslog.
   - `src/maintenance/intent-cleanup.mjs` [NEW]: Batch deletion worker for expired, unreferenced intents.
+  - `src/maintenance/retention-worker.mjs` [NEW]: Centralized retention worker executing 30-day payload pruning, 90-day metadata expiration, and classified audit cleanup with legal hold support.
+  - `src/maintenance/reconciliation-worker.mjs` [NEW]: Optional background reconciliation worker querying provider verification APIs.
+  - `src/providers/flutterwave/reconciliation.mjs` [NEW]: Flutterwave transaction verification adapter.
+  - `src/providers/paystack/reconciliation.mjs` [NEW]: Paystack transaction verification adapter.
   - `tests/integration/intent-api.test.mjs` [NEW]: Intent registration, idempotency, and alias enrichment tests.
   - `tests/integration/admin-redrive.test.mjs` [NEW]: Controlled redrive test preserving event ID.
-- **Database Changes:** Writes to `payment_intent_correlations`, `payment_intent_aliases`, `audit_outbox`.
-- **Security Implications:** Enforces tenant-scoped Bearer token authentication on internal APIs.
+  - `tests/integration/retention-cleanup.test.mjs` [NEW]: Retention pruning and legal hold exception tests.
+  - `tests/integration/reconciliation.test.mjs` [NEW]: Reconciliation rate limiting, discrepancy detection, and timeout tests.
+- **Database Changes:** Writes to `payment_intent_correlations`, `payment_intent_aliases`, `audit_outbox`, `reconciliation_records`; updates `webhook_events(payload_deleted_at)`.
+- **Security Implications:** Enforces tenant-scoped Bearer token authentication on internal APIs; enforces legal hold safety; protects provider API credentials with narrowest scopes.
 
 #### Task Breakdown:
 - **Task `P11-T01` — Implement Payment-Intent Registration REST API**
@@ -1081,6 +1100,27 @@ The construction of CWIDS is structured into 15 dependency-ordered phases (Phase
   - **Objective:** Delete expired intents older than 7 days in batches of 1,000 without deleting linked event records.
   - **Files Affected:** `src/maintenance/intent-cleanup.mjs`.
   - **Commands:** `node --test tests/integration/intent-cleanup.test.mjs`.
+- **Task `P11-T05` — Implement Centralized Data Retention & Classified Audit Purging Engine**
+  - **Objective:** Execute scheduled batch retention sweeps:
+    1. **Encrypted Payload Pruning:** For `webhook_events` older than 30 days (`RETENTION_RAW_PAYLOAD_DAYS`) where `legal_hold = FALSE` and `encrypted_payload IS NOT NULL`, nullify `encrypted_payload`, `payload_nonce`, `payload_tag`, `wrapped_dek` and record `payload_deleted_at = CURRENT_TIMESTAMP`, leaving normalized metadata and foreign keys intact.
+    2. **Normalized Metadata Expiration:** For `webhook_events` older than 90 days (`RETENTION_NORMALIZED_METADATA_DAYS`) where `legal_hold = FALSE` and all linked deliveries are terminal (`delivered`, `cancelled`), archive/delete in indexed batches of 1,000.
+    3. **Classified Audit Retention:** Delete `administrative_audit_events` where `legal_hold = FALSE` based on `audit_class`: operational audits $>365$ days; security/compliance audits $>2,555$ days (7 years).
+    4. **Legal Hold Enforcement:** Any row where `legal_hold = TRUE` MUST be bypassed by retention queries.
+    5. **Auditability:** Record retention execution summary (rows pruned, duration, errors) to `administrative_audit_events`.
+  - **Files Affected:** `src/maintenance/retention-worker.mjs`, `tests/integration/retention-cleanup.test.mjs`.
+  - **Commands:** `node --test tests/integration/retention-cleanup.test.mjs`.
+  - **Acceptance Criteria:** Prunes payload bytes while retaining event metadata; skips legal hold records; logs auditable summary.
+- **Task `P11-T06` — Implement Optional Automated Provider Reconciliation Engine**
+  - **Objective:** Background reconciliation daemon querying Flutterwave and Paystack transaction verification APIs:
+    1. **Independent Operation & Disabled by Default:** Guarded by `RECONCILIATION_ENABLED=false`. Runs as an independent worker; failure or timeout does NOT impact webhook ingestion or delivery.
+    2. **Provider-Specific Adapters:** Calls kept behind `src/providers/flutterwave/reconciliation.mjs` and `src/providers/paystack/reconciliation.mjs` using narrowest credential scopes.
+    3. **Trusted Correlation:** Candidates selected from local `payment_intent_correlations` and `provider_connections` older than 30 minutes; never routes via untrusted fields.
+    4. **Bounded Execution:** Enforces concurrency limits (`max: 2`), socket timeout (10,000ms), rate limiting (5 req/sec), and exponential backoff.
+    5. **Discrepancy Reporting:** Compares provider verification (status, amount, currency, reference) against intent. Discrepancies are inserted into `reconciliation_records` and flagged for operator review; does NOT trigger automatic downstream fulfillment or silently rewrite event history.
+    6. **Idempotency:** Safe to retry; locks candidate row to prevent concurrent processing.
+  - **Files Affected:** `src/maintenance/reconciliation-worker.mjs`, `src/providers/flutterwave/reconciliation.mjs`, `src/providers/paystack/reconciliation.mjs`, `tests/integration/reconciliation.test.mjs`.
+  - **Commands:** `node --test tests/integration/reconciliation.test.mjs`.
+  - **Acceptance Criteria:** Verifies matched intents; records discrepancies; handles provider timeouts cleanly without affecting ingress.
   - **Dependencies Unlocked:** Phase 12 observability and operational tooling.
 
 ---
@@ -1200,9 +1240,12 @@ The following comprehensive table catalogues every file created, modified, or mi
 | `src/db/repositories/deliveries-repo.mjs` | Create | Repository for delivery claims, updates, and lease sweeps | `src/db/transaction.mjs` | `worker-fencing.test.mjs` | Implements `FOR UPDATE SKIP LOCKED` and fenced updates. |
 | `src/db/repositories/attempts-repo.mjs` | Create | Append-only repository for outbound network attempts | `src/db/transaction.mjs` | `worker-fencing.test.mjs` | Inserts attempt records with 2KB capped response. |
 | `src/db/repositories/audit-outbox-repo.mjs`| Create | Repository for administrative audit outbox queue | `src/db/transaction.mjs` | `admin-redrive.test.mjs`| Inserts outbox rows committed with administrative actions. |
+| `src/db/repositories/reconciliation-repo.mjs`| Create | Repository for transaction reconciliation checks and discrepancy records | `src/db/transaction.mjs` | `reconciliation.test.mjs` | Inserts verification evidence and discrepancy reports. |
 | `src/providers/base-adapter.mjs` | Create | Abstract adapter base with constant-time equality helper | `node:crypto` | `flutterwave-adapter.test.mjs`| Buffer length mismatch fails closed safely. |
 | `src/providers/flutterwave/adapter.mjs` | Create | Flutterwave HMAC-SHA256 and `verif-hash` signature verification | `node:crypto` | `flutterwave-adapter.test.mjs`| Verifies raw bytes; normalizes transaction payload. |
 | `src/providers/paystack/adapter.mjs` | Create | Paystack HMAC-SHA512 signature verification and parsing | `node:crypto` | `paystack-adapter.test.mjs` | Verifies raw bytes; normalizes charge/transfer payload. |
+| `src/providers/flutterwave/reconciliation.mjs` | Create | Flutterwave REST transaction verification adapter | `node:https` | `reconciliation.test.mjs` | Queries `GET /v3/transactions/:id/verify`; normalizes status. |
+| `src/providers/paystack/reconciliation.mjs` | Create | Paystack REST transaction verification adapter | `node:https` | `reconciliation.test.mjs` | Queries `GET /transaction/verify/:ref`; normalizes status. |
 | `src/providers/adapter-registry.mjs` | Create | Factory resolving provider adapter by provider name string | Adapters | `npm run typecheck` | Throws descriptive error on unsupported provider. |
 | `src/routing/routing-resolver.mjs` | Create | Deterministic local routing engine (Modes A, B, C, D) | Repositories | `routing-resolver.test.mjs` | Zero external network calls; quarantines unmatched events. |
 | `src/routing/alias-manager.mjs` | Create | Helper querying `payment_intent_aliases` for dynamic IDs | Repositories | `routing-resolver.test.mjs` | Resolves virtual account and provider reference aliases. |
@@ -1223,6 +1266,8 @@ The following comprehensive table catalogues every file created, modified, or mi
 | `src/admin/audit-service.mjs` | Create | Service logging operational actions and writing to outbox | Repositories | `admin-redrive.test.mjs` | Commits audit event and outbox row atomically. |
 | `src/maintenance/intent-cleanup.mjs` | Create | Scheduled worker deleting expired, unreferenced intents | Repositories | `intent-cleanup.test.mjs` | Deletes in 1,000-row chunks; preserves referenced intents. |
 | `src/maintenance/audit-exporter.mjs` | Create | Daemon draining `audit_outbox` to stdout/syslog | Repositories | `audit-exporter.test.mjs` | Emits structured JSON records for SIEM ingestion. |
+| `src/maintenance/retention-worker.mjs` | Create | Centralized data retention worker executing 30d payload pruning, 90d metadata expiration, and classified audit purging | Repositories | `retention-cleanup.test.mjs` | Bypasses `legal_hold = TRUE`; prunes ciphertext while keeping metadata; logs audit summary. |
+| `src/maintenance/reconciliation-worker.mjs` | Create | Optional background reconciliation daemon querying provider APIs | Adapters, Repositories | `reconciliation.test.mjs` | Disabled by default; reports discrepancies to `reconciliation_records` without blocking core ingress. |
 | `src/observability/logger.mjs` | Create | Structured JSON logger with automated credential redaction | `node:process` | `logger.test.mjs` | Emits machine-readable logs; redacts secrets. |
 | `src/observability/metrics.mjs` | Create | Prometheus metrics registry exposing `/metrics` on port 9090 | None | `metrics.test.mjs` | Instruments counters, histograms, and gauges. |
 | `src/ingress/health.mjs` | Create | Liveness (`/live`) and database-backed Readiness (`/ready`) | `src/db/pool.mjs` | `health-probes.test.mjs` | Returns HTTP 503 when database pool is unreachable. |
@@ -1298,6 +1343,12 @@ Every mandatory failure scenario from Section 46 of the technical specification 
 | `TC-27` | Cross-Tenant RLS | `tests/integration/tenant-rls.test.mjs` | `node --test tests/integration/tenant-rls.test.mjs` | Tenant query without WHERE clause returns 0 other rows. |
 | `TC-31` | 72h Horizon Exhaust | `tests/unit/retry-policy.test.mjs` | `node --test tests/unit/retry-policy.test.mjs` | Retries cease after 72h; marks `dead_lettered`. |
 | `TC-37` | 2KB Stream Cap | `tests/unit/http-dispatcher.test.mjs` | `node --test tests/unit/http-dispatcher.test.mjs` | 50MB response stream severed at 2,048 bytes. |
+| `TC-39` | 30d Payload Pruning | `tests/integration/retention-cleanup.test.mjs` | `node --test tests/integration/retention-cleanup.test.mjs` | Ciphertext nullified, `payload_deleted_at` populated; metadata & FKs preserved. |
+| `TC-40` | Legal Hold Retention Bypass | `tests/integration/retention-cleanup.test.mjs` | `node --test tests/integration/retention-cleanup.test.mjs` | Records with `legal_hold = TRUE` skipped during retention sweep. |
+| `TC-41` | Classified Audit Retention | `tests/integration/retention-cleanup.test.mjs` | `node --test tests/integration/retention-cleanup.test.mjs` | Operational audits purged after 365d; security audits retained for 2,555d (7y). |
+| `TC-42` | Reconciliation Discrepancy | `tests/integration/reconciliation.test.mjs` | `node --test tests/integration/reconciliation.test.mjs` | Mismatch inserted into `reconciliation_records`; zero silent downstream mutations. |
+| `TC-43` | Reconciliation Outage Isolation | `tests/integration/reconciliation.test.mjs` | `node --test tests/integration/reconciliation.test.mjs` | Provider REST 504/timeout does not degrade webhook ingress or delivery queue. |
+| `TC-44` | Reconciliation Idempotency | `tests/integration/reconciliation.test.mjs` | `node --test tests/integration/reconciliation.test.mjs` | Repeated verification runs safe to execute; locks prevent duplicate concurrent runs. |
 
 ---
 
@@ -1349,6 +1400,30 @@ CWIDS maintains strict supply chain hygiene by minimizing third-party packages a
 | `@types/pg` | Dev | Type definitions for PostgreSQL Pool and Client queries. | Official DefinitelyTyped package. |
 | `madge` | Dev | Static analysis tool detecting circular module dependencies in CI. | Dev-only; zero runtime impact. |
 
+### 24.1 Environment Configuration Parameters
+
+The service configuration (`src/config/env.mjs`) validates and exposes the following parameters:
+
+| Variable Name | Required | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `NODE_ENV` | No | `development` | Runtime environment (`development`, `staging`, `production`). |
+| `PORT` | No | `3000` | Inbound webhook HTTP gateway port. |
+| `ADMIN_PORT` | No | `3001` | Internal payment-intent & administrative API port. |
+| `METRICS_PORT` | No | `9090` | Internal Prometheus telemetry scrape port. |
+| `DATABASE_URL` | Yes | — | PostgreSQL connection URI for application pool. |
+| `CWIDS_KEK_BASE64` | Yes | — | Base64-encoded 256-bit Key Encryption Key for AES-256-GCM envelope encryption. |
+| `ADMIN_API_TOKEN` | Yes | — | Bearer token for internal and administrative REST APIs. |
+| `RETENTION_RAW_PAYLOAD_DAYS` | No | `30` | Days to retain encrypted raw payload ciphertext before pruning. |
+| `RETENTION_NORMALIZED_METADATA_DAYS` | No | `90` | Days to retain normalized webhook event metadata before archival/purging. |
+| `RETENTION_AUDIT_SECURITY_DAYS` | No | `2555` | Days to retain security and compliance administrative audit records (7 years). |
+| `RETENTION_AUDIT_OPERATIONAL_DAYS` | No | `365` | Days to retain operational administrative audit records (1 year). |
+| `RECONCILIATION_ENABLED` | No | `false` | Enable optional background automated provider reconciliation worker. |
+| `RECONCILIATION_INTERVAL_MIN` | No | `60` | Background reconciliation polling sweep interval in minutes. |
+| `RECONCILIATION_TIMEOUT_MS` | No | `10000` | Socket timeout for outbound provider REST verification calls in ms. |
+| `RECONCILIATION_CONCURRENCY` | No | `2` | Max concurrent reconciliation verification queries. |
+| `FLUTTERWAVE_RECONCILIATION_SECRET_KEY` | Optional | — | Narrowly scoped Flutterwave API secret key (only if reconciliation is enabled). |
+| `PAYSTACK_RECONCILIATION_SECRET_KEY` | Optional | — | Narrowly scoped Paystack API secret key (only if reconciliation is enabled). |
+
 ---
 
 ## 25. Acceptance Criteria for Each Phase
@@ -1366,9 +1441,9 @@ Every phase has strict, objective exit criteria that must be satisfied before ma
 - **Phase 8:** Worker claims via `SKIP LOCKED`; stale worker update affects 0 rows; lease recovery sweeps succeed.
 - **Phase 9:** SSRF agent blocks private IPs and DNS rebinding; responses truncated at 2KB; HMAC signatures verified.
 - **Phase 10:** 72h exponential backoff calculus caps at 2h delay; circuit breaker trips to OPEN on 5 failures in 60s.
-- **Phase 11:** `POST /v1/internal/payment-intents` registers intents with minor units; manual redrive preserves event ID.
+- **Phase 11:** `POST /v1/internal/payment-intents` registers intents with minor units; manual redrive preserves event ID; data retention worker prunes encrypted payloads at 30d while retaining metadata and respecting legal holds; optional reconciliation worker operates independently without blocking ingress.
 - **Phase 12:** `/metrics` exposes Prometheus counters; `/live` and `/ready` respond accurately; graceful shutdown verified.
-- **Phase 13:** All 38 mandatory failure and concurrency scenarios pass in automated test suites.
+- **Phase 13:** All 44 failure, retention, reconciliation, and concurrency scenarios pass in automated test suites (`TC-01` through `TC-44`).
 - **Phase 14:** PM2 ecosystem starts; DR restore drill verifies RPO $<15$m; Go/No-Go checklist signed off.
 
 ---
@@ -1419,6 +1494,8 @@ The following table records the implementation mapping for all approved Architec
 | **ADR-08** | Payment Retry Horizon | 72-Hour Capped Exponential Backoff with Full Jitter | Phase 10 | `src/delivery/retry-policy.mjs` |
 | **ADR-09** | Tenant Isolation Architecture | PostgreSQL Row-Level Security (RLS) with session var | Phase 4 | `src/db/migrations/002.sql`, `src/db/transaction.mjs`|
 | **ADR-10** | Ingress Backpressure Strategy | High-burst DB queueing; HTTP 503 at pool exhaustion| Phase 7 | `src/ingress/admission-limiter.mjs` |
+| **ADR-11** | Automated Provider Reconciliation | Optional background worker querying provider REST APIs; disabled by default; reports discrepancies without silent mutation | Phase 11 | `src/maintenance/reconciliation-worker.mjs`, `src/providers/*/reconciliation.mjs` |
+| **ADR-12** | Classified Data Retention & Legal Holds | 30d raw payload pruning, 90d metadata expiration, classified audit purge (365d operational, 7y security); `legal_hold` exception | Phase 11 | `src/maintenance/retention-worker.mjs` |
 
 ---
 
@@ -1454,6 +1531,13 @@ Every requirement from the technical specification is mapped directly to its con
 | `REL-003` (Circuit Breaker) | §20.1 | Phase 10 | `src/delivery/circuit-breaker.mjs` | `tests/integration/circuit-breaker.test.mjs` |
 | `PERF-001` (Ingress Latency) | §4.3 | Phase 7, Phase 13 | `src/ingestion/ingestion-service.mjs` | Ingress Load Test Suite ($<50$ms p95) |
 | `PERF-002` (Claim Latency) | §15.1 | Phase 4, Phase 8 | `src/db/migrations/003.sql` | Database Query Profiler ($<10$ms p95) |
+| `RECON-001` (Provider Verification) | §36 | Phase 11 | `src/providers/*/reconciliation.mjs` | `tests/integration/reconciliation.test.mjs` |
+| `RECON-002` (Discrepancy Reporting) | §36 | Phase 11 | `src/maintenance/reconciliation-worker.mjs` | `tests/integration/reconciliation.test.mjs` |
+| `RECON-003` (Outage Isolation) | §36 | Phase 11 | `src/maintenance/reconciliation-worker.mjs` | `tests/integration/reconciliation.test.mjs` |
+| `RETENTION-001` (30d Payload Pruning) | §38 | Phase 11 | `src/maintenance/retention-worker.mjs` | `tests/integration/retention-cleanup.test.mjs` |
+| `RETENTION-002` (90d Metadata Expiration)| §38 | Phase 11 | `src/maintenance/retention-worker.mjs` | `tests/integration/retention-cleanup.test.mjs` |
+| `RETENTION-003` (Classified Audit) | §38 | Phase 11 | `src/maintenance/retention-worker.mjs` | `tests/integration/retention-cleanup.test.mjs` |
+| `RETENTION-004` (Legal Hold Bypass) | §38 | Phase 11 | `src/maintenance/retention-worker.mjs` | `tests/integration/retention-cleanup.test.mjs` |
 
 ---
 
@@ -1504,6 +1588,14 @@ The implementation plan was subjected to a hostile architectural review prior to
 ### Finding 5: Outbound Socket Leaks on DNS Timeout
 - **Hostile Challenge:** If a destination nameserver hangs during connection-time DNS lookup, the delivery worker might leak internal socket handles indefinitely.
 - **Plan Revision Applied:** Section 25.2 and Phase 9 require wrapping the `dns.lookup` call in a strict 3,000ms timeout using `AbortSignal.timeout(3000)`. If DNS does not resolve within 3 seconds, the socket creation callback immediately fails, recording a transient network timeout.
+
+### Finding 6: Foreign-Key Cascade vs. Payload Nullification in Data Retention
+- **Hostile Challenge:** Naive deletion of old webhook events would violate foreign keys from `event_deliveries` or destroy historical delivery and audit evidence needed for financial reconciliation.
+- **Plan Revision Applied:** Task `P11-T05` and ADR-12 implement a two-stage retention lifecycle: at 30 days (`RETENTION_RAW_PAYLOAD_DAYS`), only the sensitive encrypted payload bytes and envelope encryption keys (`encrypted_payload`, `payload_nonce`, `payload_tag`, `wrapped_dek`) are nullified, setting `payload_deleted_at = CURRENT_TIMESTAMP`. The event record, delivery attempts, and normalized metadata remain intact for dispute resolution. Full event deletion occurs only after 90 days (`RETENTION_NORMALIZED_METADATA_DAYS`) and only when all linked deliveries have reached terminal status. Any row marked `legal_hold = TRUE` is strictly bypassed.
+
+### Finding 7: Provider Reconciliation Resource Starvation
+- **Hostile Challenge:** If Flutterwave or Paystack REST APIs experience high latency or complete outage, background reconciliation queries could exhaust database connections, clog worker execution pools, and degrade core webhook ingestion or delivery throughput.
+- **Plan Revision Applied:** Task `P11-T06` and ADR-11 strictly decouple automated reconciliation from the core pipeline: it is disabled by default (`RECONCILIATION_ENABLED=false`), executes within an independent maintenance worker, enforces a strict concurrency ceiling (`RECONCILIATION_CONCURRENCY=2`), and wraps all provider REST requests in an aggressive 10,000ms socket timeout with exponential backoff. Reconciliation timeouts and errors are logged to `reconciliation_records` and administrative audits without blocking or degrading webhook ingestion or delivery queues.
 
 ---
 
