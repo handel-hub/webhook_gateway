@@ -52,3 +52,6 @@ if (process.argv[1] && (process.argv[1].endsWith('index.mjs') || process.argv[1]
     process.exit(1);
   });
 }
+
+export { verifyCwidsWebhook } from './security/verify-cwids-webhook.mjs';
+export { generateOutboundSignature, verifyOutboundSignature } from './security/hmac-signer.mjs';

@@ -56,6 +56,7 @@
  * @typedef {object} WebhookEventRecord
  * @property {string} id - UUID
  * @property {string} provider_connection_id - UUID
+ * @property {string} provider - Provider identifier ('flutterwave' | 'paystack')
  * @property {'live' | 'test'} environment
  * @property {string} identity_strategy_version
  * @property {string} dedupe_key

@@ -114,6 +114,8 @@ export const DeliveryService = {
     // 3. Dispatch outbound HTTP request
     const dispatchResult = await dispatchWebhook({
       deliveryId: claim.deliveryId,
+      eventId: event.id,
+      provider: event.provider,
       targetUrl: endpoint.url,
       payload: decryptedPayload,
       signingSecret: endpoint.signing_secret,

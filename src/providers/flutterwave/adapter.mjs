@@ -86,24 +86,12 @@ export const FlutterwaveAdapter = {
     const dedupeKey = this.generateDedupeKey(parsed);
     const data = parsed.data ?? parsed;
 
-    // Flutterwave amounts are typically in decimal major units (e.g. 500.00 NGN)
-    let amountMinor = null;
-    if (data.amount !== undefined && data.amount !== null) {
-      const parsedAmount = Number(data.amount);
-      if (!Number.isNaN(parsedAmount)) {
-        amountMinor = Math.round(parsedAmount * 100);
-      }
-    }
-
     /** @type {NormalizedPayload} */
     const normalized = {
       eventType: parsed.event || parsed['event.type'] || 'charge.completed',
       merchantReference: data.tx_ref ? String(data.tx_ref) : null,
       providerReference: data.id !== undefined && data.id !== null ? String(data.id) : (data.flw_ref ? String(data.flw_ref) : null),
       virtualAccountId: data.order_ref ? String(data.order_ref) : null,
-      amountMinor,
-      currency: data.currency ? String(data.currency).toUpperCase() : null,
-      providerStatus: String(data.status || 'unknown'),
       rawData: parsed,
     };
 

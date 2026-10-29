@@ -30,6 +30,20 @@
  */
 
 /**
+ * Parameters for dispatching an outbound webhook.
+ * @typedef {object} DispatchWebhookParams
+ * @property {string} deliveryId - Unique delivery UUID.
+ * @property {string} [eventId] - Unique webhook event UUID.
+ * @property {string} [provider] - Originating provider.
+ * @property {string} targetUrl - Destination HTTPS URL.
+ * @property {Buffer | string} payload - Webhook payload body.
+ * @property {string} signingSecret - Application signing secret.
+ * @property {number} [timeoutMs] - Request timeout.
+ * @property {any} [agent] - Custom HTTP/HTTPS agent.
+ * @property {'envelope' | 'http_status'} [responseValidationMode] - Response validation mode.
+ */
+
+/**
  * Result of executing an outbound HTTPS delivery attempt.
  * @typedef {object} DeliveryAttemptResult
  * @property {number} httpStatus - HTTP response status code (e.g. 200, 500).

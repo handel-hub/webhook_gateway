@@ -72,24 +72,12 @@ export const PaystackAdapter = {
     const dedupeKey = this.generateDedupeKey(parsed);
     const data = parsed.data ?? parsed;
 
-    // Paystack amounts are already in integer minor units (kobo / cents)
-    let amountMinor = null;
-    if (data.amount !== undefined && data.amount !== null) {
-      const parsedAmount = Number(data.amount);
-      if (!Number.isNaN(parsedAmount)) {
-        amountMinor = Math.round(parsedAmount);
-      }
-    }
-
     /** @type {NormalizedPayload} */
     const normalized = {
       eventType: parsed.event || 'charge.success',
       merchantReference: data.reference ? String(data.reference) : null,
       providerReference: data.id !== undefined && data.id !== null ? String(data.id) : null,
       virtualAccountId: data.dedicated_account_number || (data.customer?.customer_code ? String(data.customer.customer_code) : null),
-      amountMinor,
-      currency: data.currency ? String(data.currency).toUpperCase() : null,
-      providerStatus: String(data.status || 'unknown'),
       rawData: parsed,
     };
 

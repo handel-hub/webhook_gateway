@@ -3,15 +3,17 @@
  */
 
 /**
- * Normalized representation of inbound provider payload.
+ * Transport routing metadata extracted from inbound provider payload.
+ * Used strictly for database routing lookups (Modes A and C) and event indexing;
+ * never used to transform or rewrite the delivered raw payload body.
  * @typedef {object} NormalizedPayload
- * @property {string} eventType - Normalized event category (e.g. 'charge.completed', 'transfer.failed').
- * @property {string | null} merchantReference - Merchant order or transaction reference.
- * @property {string | null} providerReference - Provider transaction ID or flw_ref.
- * @property {string | null} virtualAccountId - Virtual bank account identifier.
- * @property {number | null} amountMinor - Transaction amount in integer minor units (kobo, cents).
- * @property {string | null} currency - Three-letter uppercase ISO currency code.
- * @property {string} providerStatus - Original raw status string from provider.
+ * @property {string} eventType - Provider event category (e.g. 'charge.completed', 'charge.success').
+ * @property {string | null} merchantReference - Merchant order/transaction reference for Mode A intent correlation.
+ * @property {string | null} providerReference - Provider transaction ID for Mode C alias correlation.
+ * @property {string | null} virtualAccountId - Virtual account identifier for Mode C alias correlation.
+ * @property {number | null} [amountMinor] - Optional legacy amount (not used for gateway routing).
+ * @property {string | null} [currency] - Optional legacy currency (not used for gateway routing).
+ * @property {string} [providerStatus] - Optional legacy provider status (not used for gateway routing).
  * @property {Record<string, any>} rawData - Unaltered parsed JSON body object.
  */
 

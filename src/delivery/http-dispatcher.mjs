@@ -14,6 +14,8 @@ import { LIMITS } from '../config/limits.mjs';
  *
  * @param {object} params
  * @param {string} params.deliveryId - Unique delivery UUID.
+ * @param {string} [params.eventId] - Unique webhook event UUID.
+ * @param {string} [params.provider] - Originating provider (e.g. 'paystack', 'flutterwave').
  * @param {string} params.targetUrl - Destination HTTPS URL.
  * @param {Buffer | string} params.payload - Webhook payload body.
  * @param {string} params.signingSecret - Application signing secret.
@@ -24,6 +26,8 @@ import { LIMITS } from '../config/limits.mjs';
  */
 export async function dispatchWebhook({
   deliveryId,
+  eventId,
+  provider,
   targetUrl,
   payload,
   signingSecret,
@@ -32,8 +36,9 @@ export async function dispatchWebhook({
   responseValidationMode = 'http_status',
 }) {
   const startTime = Date.now();
+  const timestampSeconds = Math.floor(startTime / 1000);
   const payloadBuffer = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, 'utf8');
-  const signatureHeader = generateOutboundSignature(deliveryId, payloadBuffer, signingSecret);
+  const signatureHeader = generateOutboundSignature(deliveryId, payloadBuffer, signingSecret, timestampSeconds);
 
   const url = new URL(targetUrl);
   const isHttps = url.protocol === 'https:';
@@ -50,6 +55,9 @@ export async function dispatchWebhook({
       'Content-Length': payloadBuffer.length,
       'User-Agent': 'CWIDS-Webhook-Delivery/1.0',
       'X-CWIDS-Delivery-ID': deliveryId,
+      'X-CWIDS-Event-ID': eventId || deliveryId,
+      'X-CWIDS-Provider': provider || 'unknown',
+      'X-CWIDS-Timestamp': String(timestampSeconds),
       'X-CWIDS-Signature': signatureHeader,
     },
     timeout: timeoutMs,
