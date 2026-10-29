@@ -173,11 +173,22 @@ export async function cleanupTestTenants(client, applicationIds) {
     [applicationIds],
   );
 
-  await client.query('DELETE FROM cwids.webhook_events WHERE application_id = ANY($1)', [applicationIds]);
+  await client.query(
+    `DELETE FROM cwids.webhook_events 
+     WHERE application_id = ANY($1)
+        OR provider_connection_id IN (SELECT id FROM cwids.provider_connections WHERE application_id = ANY($1))`,
+    [applicationIds],
+  );
   await client.query('DELETE FROM cwids.payment_intent_correlations WHERE application_id = ANY($1)', [applicationIds]);
   await client.query('DELETE FROM cwids.circuit_breaker_states WHERE destination_endpoint_id IN (SELECT id FROM cwids.destination_endpoints WHERE application_id = ANY($1))', [applicationIds]);
   await client.query('DELETE FROM cwids.destination_endpoints WHERE application_id = ANY($1)', [applicationIds]);
   await client.query('DELETE FROM cwids.provider_connections WHERE application_id = ANY($1)', [applicationIds]);
+  await client.query(
+    `DELETE FROM cwids.audit_outbox WHERE audit_event_id IN (
+       SELECT id FROM cwids.administrative_audit_events WHERE application_id = ANY($1)
+     )`,
+    [applicationIds],
+  );
   await client.query('DELETE FROM cwids.administrative_audit_events WHERE application_id = ANY($1)', [applicationIds]);
   await client.query('DELETE FROM cwids.applications WHERE id = ANY($1)', [applicationIds]);
 }

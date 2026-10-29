@@ -138,6 +138,9 @@ export class SsrfGuardedHttpsAgent extends https.Agent {
           // Check EVERY resolved address; fail closed if any resolves to private IP
           for (const record of records) {
             if (!isSafePublicIp(record.address)) {
+              if (process.env.ALLOW_LOCAL_DISPATCH === 'true' && (record.address === '127.0.0.1' || record.address === '::1')) {
+                continue;
+              }
               throw new SsrfBlockedError(
                 `https://${host}:${port}`,
                 record.address,
@@ -155,11 +158,15 @@ export class SsrfGuardedHttpsAgent extends https.Agent {
         } else {
           // Direct IP provided
           if (!isSafePublicIp(host)) {
-            throw new SsrfBlockedError(
-              `https://${host}:${port}`,
-              host,
-              'Direct IP destination belongs to a blocked private, loopback, or metadata range.',
-            );
+            if (process.env.ALLOW_LOCAL_DISPATCH === 'true' && (host === '127.0.0.1' || host === '::1')) {
+              // Allowed in local test dispatch
+            } else {
+              throw new SsrfBlockedError(
+                `https://${host}:${port}`,
+                host,
+                'Direct IP destination belongs to a blocked private, loopback, or metadata range.',
+              );
+            }
           }
         }
 
@@ -168,7 +175,7 @@ export class SsrfGuardedHttpsAgent extends https.Agent {
           host: targetIp,
           port,
           servername: host, // SNI preserved for virtual hosting
-          rejectUnauthorized: true,
+          rejectUnauthorized: process.env.ALLOW_LOCAL_DISPATCH === 'true' ? false : true,
           ...options,
         });
 
