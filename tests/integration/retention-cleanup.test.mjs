@@ -91,6 +91,11 @@ function createMockRetentionPool() {
         return { rows: [{ id: 1 }] };
       }
 
+      // 5. Unrouted alerts check
+      if (s.includes("ROUTING_STATUS IN ('AWAITING_ROUTE', 'QUARANTINED')")) {
+        return { rows: [] };
+      }
+
       throw new Error(`Unhandled SQL: ${sql}`);
     },
     release() {},

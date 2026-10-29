@@ -90,6 +90,16 @@ export const RetentionWorker = {
       }
     }
 
+    // 4. Scan and log operational alerts for ancient unrouted / quarantined events
+    await withTransaction(pool, null, async (client) => {
+      const ancientUnrouted = await EventsRepo.findUnroutedAlerts(client, 90);
+      if (ancientUnrouted.length > 0) {
+        logger.error(`OPERATIONAL_ALERT: Found ${ancientUnrouted.length} unrouted/quarantined events older than 90 days!`, undefined, {
+          sampleEventIds: ancientUnrouted.slice(0, 5).map((e) => e.id),
+        });
+      }
+    });
+
     const durationMs = Date.now() - startTime;
 
     // 4. Auditability: Record retention execution summary to administrative_audit_events

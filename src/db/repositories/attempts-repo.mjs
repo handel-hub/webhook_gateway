@@ -13,6 +13,8 @@ export const AttemptsRepo = {
    *   id?: string,
    *   deliveryId: string,
    *   applicationId?: string,
+   *   destinationEndpointId?: string | null,
+   *   endpointVersion?: number | null,
    *   attemptNumber: number,
    *   fencingToken: number,
    *   startedAt: Date,
@@ -31,11 +33,11 @@ export const AttemptsRepo = {
   async recordAttempt(client, data) {
     const res = await client.query(
       `INSERT INTO cwids.delivery_attempts
-         (id, delivery_id, application_id, attempt_number, fencing_token, started_at, finished_at,
+         (id, delivery_id, application_id, destination_endpoint_id, endpoint_version, attempt_number, fencing_token, started_at, finished_at,
           duration_ms, http_status, response_status, response_body_excerpt,
           response_truncated, error_code, error_message, worker_identity)
        VALUES
-         (COALESCE($1, gen_random_uuid()), $2, COALESCE($3, (SELECT application_id FROM cwids.event_deliveries WHERE id = $2)), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         (COALESCE($1, gen_random_uuid()), $2, COALESCE($3, (SELECT application_id FROM cwids.event_deliveries WHERE id = $2)), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        RETURNING id, delivery_id, attempt_number, fencing_token,
                  http_status, response_status, response_body_excerpt as response_excerpt,
                  response_truncated as is_truncated, duration_ms, error_code, error_message,
@@ -44,6 +46,8 @@ export const AttemptsRepo = {
         data.id ?? null,
         data.deliveryId,
         data.applicationId ?? null,
+        data.destinationEndpointId ?? null,
+        data.endpointVersion ?? null,
         data.attemptNumber,
         data.fencingToken,
         data.startedAt,

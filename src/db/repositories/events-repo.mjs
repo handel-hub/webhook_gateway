@@ -148,6 +148,8 @@ export const EventsRepo = {
 
   /**
    * Prunes raw encrypted payload bytes for events older than cutoff without legal hold (ADR-12).
+   * Unrouted and quarantined events are strictly excluded to preserve investigation payload.
+   *
    * @param {pg.PoolClient} client
    * @param {Date} cutoffDate
    * @param {number} [limit=1000]
@@ -160,6 +162,7 @@ export const EventsRepo = {
          WHERE received_at < $1
            AND encrypted_payload IS NOT NULL
            AND legal_hold = FALSE
+           AND routing_status NOT IN ('awaiting_route', 'quarantined')
          LIMIT $2
          FOR UPDATE SKIP LOCKED
        )
@@ -178,6 +181,8 @@ export const EventsRepo = {
 
   /**
    * Purges normalized metadata for webhook events older than cutoff without active deliveries or legal holds (ADR-12).
+   * Unrouted and quarantined events are strictly excluded.
+   *
    * @param {pg.PoolClient} client
    * @param {Date} cutoffDate
    * @param {number} [limit=1000]
@@ -190,6 +195,7 @@ export const EventsRepo = {
          FROM cwids.webhook_events we
          WHERE we.received_at < $1
            AND we.legal_hold = FALSE
+           AND we.routing_status NOT IN ('awaiting_route', 'quarantined')
            AND NOT EXISTS (
              SELECT 1
              FROM cwids.event_deliveries ed
@@ -210,5 +216,23 @@ export const EventsRepo = {
       [cutoffDate, limit],
     );
     return res.rowCount ?? 0;
+  },
+
+  /**
+   * Scans for unrouted events (awaiting_route, quarantined) older than threshold (e.g. 90 days) for operational alerting.
+   * @param {pg.PoolClient} client
+   * @param {number} [daysOld=90]
+   * @returns {Promise<Array<{ id: string, provider: string, routing_status: string, received_at: Date }>>}
+   */
+  async findUnroutedAlerts(client, daysOld = 90) {
+    const res = await client.query(
+      `SELECT id, provider, routing_status, received_at
+       FROM cwids.webhook_events
+       WHERE routing_status IN ('awaiting_route', 'quarantined')
+         AND received_at < CURRENT_TIMESTAMP - make_interval(days => $1)
+       LIMIT 100`,
+      [daysOld],
+    );
+    return res.rows;
   },
 };

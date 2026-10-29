@@ -48,14 +48,28 @@ export const DeliveryService = {
       return { status: 'circuit_open_deferred' };
     }
 
-    // 2. Fetch event record and decrypt payload envelope
+    // 2. Fetch event record and resolve latest active endpoint (Approved Decision 6)
     const { event, endpoint } = await withClient(pool, claim.applicationId, async (client) => {
       const ev = await EventsRepo.findById(client, claim.eventId);
       const epRes = await client.query(
-        'SELECT id, url, signing_secret, http_timeout_ms, max_retries, response_validation_mode FROM cwids.destination_endpoints WHERE id = $1',
-        [claim.destinationEndpointId],
+        `SELECT id, version, url, signing_secret, http_timeout_ms, max_retries, response_validation_mode 
+         FROM cwids.destination_endpoints 
+         WHERE application_id = $1 AND status = 'active' 
+         ORDER BY version DESC LIMIT 1`,
+        [claim.applicationId],
       );
-      return { event: ev, endpoint: epRes.rows[0] };
+      let ep = epRes.rows[0];
+      if (!ep) {
+        // Fallback to designated endpoint from claim
+        const fallbackRes = await client.query(
+          `SELECT id, version, url, signing_secret, http_timeout_ms, max_retries, response_validation_mode 
+           FROM cwids.destination_endpoints 
+           WHERE id = $1`,
+          [claim.destinationEndpointId],
+        );
+        ep = fallbackRes.rows[0];
+      }
+      return { event: ev, endpoint: ep };
     });
 
     if (!event || !endpoint) {
@@ -135,6 +149,8 @@ export const DeliveryService = {
 
         await AttemptsRepo.recordAttempt(client, {
           deliveryId: claim.deliveryId,
+          destinationEndpointId: endpoint.id,
+          endpointVersion: endpoint.version,
           attemptNumber: claim.attemptCount + 1,
           fencingToken: claim.fencingToken,
           startedAt,
@@ -164,6 +180,8 @@ export const DeliveryService = {
         // Record attempt only after successful fenced write
         await AttemptsRepo.recordAttempt(client, {
           deliveryId: claim.deliveryId,
+          destinationEndpointId: endpoint.id,
+          endpointVersion: endpoint.version,
           attemptNumber: claim.attemptCount + 1,
           fencingToken: claim.fencingToken,
           startedAt,
@@ -214,6 +232,8 @@ export const DeliveryService = {
         // Record attempt only after successful fenced write
         await AttemptsRepo.recordAttempt(client, {
           deliveryId: claim.deliveryId,
+          destinationEndpointId: endpoint.id,
+          endpointVersion: endpoint.version,
           attemptNumber: claim.attemptCount + 1,
           fencingToken: claim.fencingToken,
           startedAt,
@@ -248,6 +268,8 @@ export const DeliveryService = {
         // Record attempt only after successful fenced write
         await AttemptsRepo.recordAttempt(client, {
           deliveryId: claim.deliveryId,
+          destinationEndpointId: endpoint.id,
+          endpointVersion: endpoint.version,
           attemptNumber: claim.attemptCount + 1,
           fencingToken: claim.fencingToken,
           startedAt,
