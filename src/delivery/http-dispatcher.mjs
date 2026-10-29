@@ -19,6 +19,7 @@ import { LIMITS } from '../config/limits.mjs';
  * @param {string} params.signingSecret - Application signing secret.
  * @param {number} [params.timeoutMs=15000] - Request timeout.
  * @param {any} [params.agent=ssrfAgent] - Custom agent (defaults to SSRF-guarded agent).
+ * @param {'envelope' | 'http_status'} [params.responseValidationMode='http_status'] - Response validation mode.
  * @returns {Promise<DeliveryAttemptResult>}
  */
 export async function dispatchWebhook({
@@ -28,6 +29,7 @@ export async function dispatchWebhook({
   signingSecret,
   timeoutMs = LIMITS.HTTP_DISPATCH_TIMEOUT_MS,
   agent = ssrfAgent,
+  responseValidationMode = 'http_status',
 }) {
   const startTime = Date.now();
   const payloadBuffer = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, 'utf8');
@@ -74,6 +76,57 @@ export async function dispatchWebhook({
       let totalBytes = 0;
       let isTruncated = false;
 
+      function settleResponse() {
+        const durationMs = Date.now() - startTime;
+        const responseExcerpt = Buffer.concat(chunks).toString('utf8');
+
+        /** @type {DestinationResponseStatus} */
+        let responseStatus = 'http_acknowledged_unverified';
+        /** @type {string | null} */
+        let errorCode = null;
+
+        if (responseValidationMode === 'envelope') {
+          try {
+            const parsed = JSON.parse(responseExcerpt);
+            if (parsed && typeof parsed === 'object') {
+              if (parsed.status === 'processed') {
+                responseStatus = 'processed';
+              } else if (parsed.status === 'duplicate_acknowledged') {
+                responseStatus = 'duplicate_acknowledged';
+              } else if (parsed.status === 'rejected') {
+                responseStatus = 'rejected';
+              } else {
+                responseStatus = 'http_acknowledged_unverified';
+                errorCode = 'INVALID_DESTINATION_ENVELOPE';
+              }
+            } else {
+              errorCode = 'INVALID_DESTINATION_ENVELOPE';
+            }
+          } catch {
+            responseStatus = 'http_acknowledged_unverified';
+            errorCode = 'INVALID_DESTINATION_ENVELOPE';
+          }
+        } else {
+          if (httpStatus >= 200 && httpStatus < 300) {
+            responseStatus = 'processed';
+          } else if (httpStatus === 409) {
+            responseStatus = 'duplicate_acknowledged';
+          } else if (httpStatus >= 400 && httpStatus < 500) {
+            responseStatus = 'rejected';
+          }
+        }
+
+        finish({
+          httpStatus,
+          responseStatus,
+          responseExcerpt,
+          isTruncated,
+          durationMs,
+          errorCode,
+          errorMessage: errorCode ? 'Destination returned unverified response envelope' : null,
+        });
+      }
+
       res.on('data', (chunk) => {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         totalBytes += buf.length;
@@ -89,32 +142,16 @@ export async function dispatchWebhook({
           }
           // Sever socket immediately to eliminate destination response memory inflation attack (SEC-007)
           res.destroy();
+          settleResponse();
         }
       });
 
       res.on('end', () => {
-        const durationMs = Date.now() - startTime;
-        const responseExcerpt = Buffer.concat(chunks).toString('utf8');
+        settleResponse();
+      });
 
-        /** @type {DestinationResponseStatus} */
-        let responseStatus = 'http_acknowledged_unverified';
-        if (httpStatus >= 200 && httpStatus < 300) {
-          responseStatus = 'processed';
-        } else if (httpStatus === 409) {
-          responseStatus = 'duplicate_acknowledged';
-        } else if (httpStatus >= 400 && httpStatus < 500) {
-          responseStatus = 'rejected';
-        }
-
-        finish({
-          httpStatus,
-          responseStatus,
-          responseExcerpt,
-          isTruncated,
-          durationMs,
-          errorCode: null,
-          errorMessage: null,
-        });
+      res.on('close', () => {
+        settleResponse();
       });
 
       res.on('error', (err) => {

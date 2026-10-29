@@ -35,8 +35,9 @@ test('PostgreSQL Row-Level Security prevents cross-tenant data leakage', async (
       [tenantAId, tenantBId],
     );
 
-    // Switch context to Tenant A
+    // Switch context to Tenant A and execute as runtime role subject to RLS
     await client.query("SELECT set_config('app.current_tenant', $1, true)", [tenantAId]);
+    await client.query('SET ROLE cwids_worker;');
 
     // Query applications without WHERE clause
     const resA = await client.query('SELECT id, code FROM cwids.applications');
@@ -47,7 +48,9 @@ test('PostgreSQL Row-Level Security prevents cross-tenant data leakage', async (
     assert.ok(!idsVisibleToA.includes(tenantBId), 'Tenant A MUST NOT see Tenant B rows under RLS.');
 
     // Switch context to Tenant B
+    await client.query('RESET ROLE;');
     await client.query("SELECT set_config('app.current_tenant', $1, true)", [tenantBId]);
+    await client.query('SET ROLE cwids_worker;');
     const resB = await client.query('SELECT id, code FROM cwids.applications');
     const idsVisibleToB = resB.rows.map((r) => r.id);
 

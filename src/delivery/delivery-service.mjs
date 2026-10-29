@@ -52,7 +52,7 @@ export const DeliveryService = {
     const { event, endpoint } = await withClient(pool, claim.applicationId, async (client) => {
       const ev = await EventsRepo.findById(client, claim.eventId);
       const epRes = await client.query(
-        'SELECT id, url, signing_secret, http_timeout_ms, max_retries FROM cwids.destination_endpoints WHERE id = $1',
+        'SELECT id, url, signing_secret, http_timeout_ms, max_retries, response_validation_mode FROM cwids.destination_endpoints WHERE id = $1',
         [claim.destinationEndpointId],
       );
       return { event: ev, endpoint: epRes.rows[0] };
@@ -104,14 +104,58 @@ export const DeliveryService = {
       payload: decryptedPayload,
       signingSecret: endpoint.signing_secret,
       timeoutMs: endpoint.http_timeout_ms,
+      responseValidationMode: endpoint.response_validation_mode ?? 'http_status',
     });
 
     const finishedAt = new Date();
     const durationMs = finishedAt.getTime() - startedAt.getTime();
-    const isSuccess = dispatchResult.httpStatus >= 200 && dispatchResult.httpStatus < 300;
+
+    // Determine delivery success based on status and response validation mode
+    let isSuccess = dispatchResult.httpStatus >= 200 && dispatchResult.httpStatus < 300;
+    if (endpoint.response_validation_mode === 'envelope') {
+      if (dispatchResult.responseStatus === 'processed' || dispatchResult.responseStatus === 'duplicate_acknowledged') {
+        isSuccess = dispatchResult.httpStatus >= 200 && dispatchResult.httpStatus < 300;
+      } else {
+        isSuccess = false;
+      }
+    }
 
     // 4. Update Database inside transaction enforcing fencing token match FIRST before auditing attempt
     return withTransaction(pool, claim.applicationId, async (client) => {
+      // In envelope mode, if destination explicitly returned rejected, dead-letter immediately
+      if (endpoint.response_validation_mode === 'envelope' && dispatchResult.responseStatus === 'rejected') {
+        await LeaseManager.deadLetterFenced(
+          client,
+          claim.deliveryId,
+          claim.fencingToken,
+          'DESTINATION_REJECTED',
+          dispatchResult.httpStatus,
+          dispatchResult.errorCode,
+        );
+
+        await AttemptsRepo.recordAttempt(client, {
+          deliveryId: claim.deliveryId,
+          attemptNumber: claim.attemptCount + 1,
+          fencingToken: claim.fencingToken,
+          startedAt,
+          finishedAt,
+          durationMs,
+          httpStatus: dispatchResult.httpStatus,
+          responseStatus: dispatchResult.responseStatus,
+          responseExcerpt: dispatchResult.responseExcerpt,
+          isTruncated: dispatchResult.isTruncated,
+          errorCode: dispatchResult.errorCode,
+          errorMessage: dispatchResult.errorMessage,
+          workerIdentity,
+        });
+
+        logger.warn('Delivery permanently rejected by destination envelope response', {
+          deliveryId: claim.deliveryId,
+          attempt: claim.attemptCount + 1,
+        });
+        return { status: 'dead_lettered' };
+      }
+
       if (isSuccess) {
         // Enforce monotonic fencing token match FIRST
         await LeaseManager.completeFenced(client, claim.deliveryId, claim.fencingToken);

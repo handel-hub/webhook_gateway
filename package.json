@@ -13,7 +13,7 @@
     "start:worker": "node src/worker.mjs",
     "migrate": "node src/db/migrate.mjs",
     "typecheck": "tsc --project jsconfig.json",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1",
     "circular-check": "madge --circular src/"
   },
   "keywords": [

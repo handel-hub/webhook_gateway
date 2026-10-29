@@ -26,8 +26,7 @@ function createMockFencingPool() {
       const s = sql.replace(/\s+/g, ' ').trim().toUpperCase();
 
       // Lease recovery sweep:
-      // UPDATE event_deliveries SET status = 'retry_scheduled' WHERE status = 'in_flight' AND lease_expires_at < CURRENT_TIMESTAMP
-      if (s.includes("SET STATUS = 'RETRY_SCHEDULED'") && s.includes('LEASE_EXPIRES_AT < CURRENT_TIMESTAMP')) {
+      if (s.includes('EVENT_DELIVERIES') && s.includes('LEASE_EXPIRES_AT < CURRENT_TIMESTAMP')) {
         let count = 0;
         const now = Date.now();
         for (const deliv of deliveries.values()) {

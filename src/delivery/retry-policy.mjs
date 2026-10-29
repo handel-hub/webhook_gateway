@@ -17,8 +17,13 @@ export function isRetryableFailure(httpStatus, errorCode = null) {
     return true;
   }
 
-  // HTTP 429 (Rate Limited) and HTTP 408 (Request Timeout) are transient
-  if (httpStatus === 429 || httpStatus === 408) {
+  // HTTP 501 Not Implemented is permanent
+  if (httpStatus === 501) {
+    return false;
+  }
+
+  // HTTP 429 (Rate Limited), HTTP 408 (Request Timeout), and HTTP 425 (Too Early) are transient
+  if (httpStatus === 429 || httpStatus === 408 || httpStatus === 425) {
     return true;
   }
 
@@ -61,13 +66,17 @@ export function evaluateRetry({
 }) {
   const retryable = isRetryableFailure(httpStatus, errorCode);
 
-  // If destination explicitly rejected with non-retryable 4xx
+  // If destination explicitly rejected with non-retryable status
   if (!retryable) {
     return {
       shouldRetry: false,
       nextAttemptAt: null,
       isDeadLetter: true,
-      terminalReason: httpStatus >= 400 && httpStatus < 500 ? 'CLIENT_REJECTED' : 'UNRETRYABLE_ERROR',
+      terminalReason: httpStatus === 501
+        ? 'NOT_IMPLEMENTED'
+        : httpStatus >= 400 && httpStatus < 500
+          ? 'CLIENT_REJECTED'
+          : 'UNRETRYABLE_ERROR',
     };
   }
 

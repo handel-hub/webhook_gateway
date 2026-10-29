@@ -13,10 +13,14 @@ test('isRetryableFailure: classifies HTTP status and network error codes correct
   // Transient HTTP errors
   assert.equal(isRetryableFailure(429, null), true); // Rate Limited
   assert.equal(isRetryableFailure(408, null), true); // Request Timeout
+  assert.equal(isRetryableFailure(425, null), true); // Too Early
   assert.equal(isRetryableFailure(500, null), true); // Internal Server Error
   assert.equal(isRetryableFailure(502, null), true); // Bad Gateway
   assert.equal(isRetryableFailure(503, null), true); // Service Unavailable
   assert.equal(isRetryableFailure(504, null), true); // Gateway Timeout
+
+  // Permanent HTTP 501 Not Implemented
+  assert.equal(isRetryableFailure(501, null), false);
 
   // Non-retryable HTTP 4xx Client Errors
   assert.equal(isRetryableFailure(400, null), false);
@@ -43,6 +47,20 @@ test('evaluateRetry: non-retryable 4xx dead-letters immediately as CLIENT_REJECT
   assert.equal(result.nextAttemptAt, null);
   assert.equal(result.isDeadLetter, true);
   assert.equal(result.terminalReason, 'CLIENT_REJECTED');
+});
+
+test('evaluateRetry: HTTP 501 Not Implemented dead-letters immediately as NOT_IMPLEMENTED', () => {
+  const result = evaluateRetry({
+    firstAttemptAt: new Date(),
+    attemptCount: 1,
+    httpStatus: 501,
+    errorCode: null,
+  });
+
+  assert.equal(result.shouldRetry, false);
+  assert.equal(result.nextAttemptAt, null);
+  assert.equal(result.isDeadLetter, true);
+  assert.equal(result.terminalReason, 'NOT_IMPLEMENTED');
 });
 
 test('evaluateRetry: 408 and 429 schedule retry with exponential backoff and jitter', () => {
