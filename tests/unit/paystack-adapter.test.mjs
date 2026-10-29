@@ -74,3 +74,20 @@ test('PaystackAdapter: length-prefixed dedupe keys avoid collision', () => {
 
   assert.notEqual(key1, key2);
 });
+
+test('PaystackAdapter: authentic signature with malformed JSON returns isMalformed = true', async () => {
+  const malformedBody = Buffer.from('{"not_valid_json:');
+  const signature = crypto.createHmac('sha512', PAYSTACK_SECRET).update(malformedBody).digest('hex');
+
+  const result = await PaystackAdapter.verifyAndNormalize(
+    malformedBody,
+    { 'x-paystack-signature': signature },
+    PAYSTACK_SECRET,
+  );
+
+  assert.equal(result.isValid, true);
+  assert.equal(result.isMalformed, true);
+  assert.equal(result.failureReason, 'Malformed JSON payload.');
+  assert.ok(result.dedupeKey.startsWith('v1:pstk:malformed:'));
+  assert.equal(result.normalized, null);
+});

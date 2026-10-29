@@ -176,3 +176,64 @@ test('IngestionService.ingestWebhook: absorbs duplicate without creating second 
   assert.equal(outcome.eventId, 'evt_existing_99');
   assert.equal(outcome.deliveryId, null);
 });
+
+test('IngestionService.ingestWebhook: persists authentic malformed webhook with routing_status = rejected without delivery', async () => {
+  /** @type {any} */
+  const mockClient = {
+    /**
+     * @param {string} sql
+     */
+    async query(sql) {
+      if (sql.includes('INSERT INTO cwids.webhook_events')) {
+        return {
+          rows: [{
+            id: 'evt_malformed_1',
+            provider_connection_id: 'conn_1',
+            environment: 'live',
+            application_id: null,
+            payment_intent_id: null,
+            routing_status: 'rejected',
+            payload_sha256: 'sha256_mock_malformed',
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+
+  /** @type {any} */
+  const mockPool = {
+    async connect() {
+      return mockClient;
+    },
+  };
+
+  /** @type {any} */
+  const mockConnection = {
+    id: 'conn_1',
+    provider: 'paystack',
+    environment: 'live',
+    application_id: null,
+  };
+
+  const rawBody = Buffer.from('{"not_valid_json:');
+  const payloadSha256 = crypto.createHash('sha256').update(rawBody).digest('hex');
+
+  const outcome = await IngestionService.ingestWebhook(mockPool, {
+    providerConnection: mockConnection,
+    rawBody,
+    payloadSha256,
+    verification: {
+      isValid: true,
+      isMalformed: true,
+      failureReason: 'Malformed JSON payload.',
+      dedupeKey: 'v1:pstk:malformed:hash123',
+      normalized: null,
+    },
+  });
+
+  assert.equal(outcome.routingStatus, 'rejected');
+  assert.equal(outcome.deliveryId, null);
+  assert.equal(outcome.isDuplicate, false);
+});

@@ -83,3 +83,18 @@ test('FlutterwaveAdapter: generates length-prefixed dedupe key immune to delimit
 
   assert.notEqual(key1, key2);
 });
+
+test('FlutterwaveAdapter: authentic signature with malformed JSON returns isMalformed = true', async () => {
+  const malformedBody = Buffer.from('{"invalid_json:');
+  const result = await FlutterwaveAdapter.verifyAndNormalize(
+    malformedBody,
+    { 'verif-hash': SECRET_HASH },
+    SECRET_HASH,
+  );
+
+  assert.equal(result.isValid, true);
+  assert.equal(result.isMalformed, true);
+  assert.equal(result.failureReason, 'Malformed JSON payload.');
+  assert.ok(result.dedupeKey.startsWith('v1:flw:malformed:'));
+  assert.equal(result.normalized, null);
+});

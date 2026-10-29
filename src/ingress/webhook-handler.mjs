@@ -91,6 +91,29 @@ export async function handleWebhookIngress(req, res) {
       delivery_id: outcome.deliveryId,
     });
   } catch (err) {
+    const errorName = err instanceof Error ? err.name : '';
+    const errorCode = (err && typeof err === 'object' && 'code' in err) ? /** @type {any} */ (err).code : '';
+    const errorMessage = err instanceof Error ? err.message : String(err);
+
+    // B1: Infrastructure capacity errors -> HTTP 503 with Retry-After: 30
+    const isPoolOrConnError =
+      errorName === 'PoolAcquisitionTimeoutError' ||
+      errorCode === 'ECONNREFUSED' ||
+      errorCode === '57P01' ||
+      errorCode === '53300' ||
+      errorMessage.includes('timeout exceeded when connecting to database') ||
+      errorMessage.includes('Connection terminated unexpectedly');
+
+    if (isPoolOrConnError) {
+      logger.error('Database infrastructure backpressure during webhook ingestion', err instanceof Error ? err : new Error(String(err)));
+      res.setHeader('Retry-After', '30');
+      res.status(503).json({
+        error: 'Service Unavailable',
+        message: 'Database connection capacity exhausted or temporarily unavailable. Please retry.',
+      });
+      return;
+    }
+
     logger.error('Unexpected error during webhook ingestion', err instanceof Error ? err : new Error(String(err)));
     res.status(500).json({
       error: 'Internal Server Error',

@@ -34,15 +34,54 @@ export const IngestionService = {
    */
   async ingestWebhook(pool, { providerConnection, rawBody, payloadSha256, verification }) {
     const env = getEnv();
-    const normalized = verification.normalized;
-    if (!normalized) {
-      throw new Error('Cannot ingest unnormalized webhook payload.');
-    }
-
     const eventId = crypto.randomUUID();
 
     // 1. Application-layer AES-256-GCM envelope encryption
     const envelope = encryptPayloadEnvelope(rawBody, eventId, env.MASTER_KEK);
+
+    const normalized = verification.normalized;
+
+    if (verification.isMalformed || !normalized) {
+      // Authenticated malformed / unsupported payload (Approved Decision 2)
+      // Persist raw encrypted payload with routing_status = 'rejected' and no delivery obligation
+      return withTransaction(pool, null, async (client) => {
+        const { event, isDuplicate } = await EventsRepo.insertEvent(client, {
+          id: eventId,
+          providerConnectionId: providerConnection.id,
+          provider: providerConnection.provider,
+          environment: providerConnection.environment,
+          identityStrategyVersion: 1,
+          dedupeKey: verification.dedupeKey,
+          providerEventId: null,
+          eventType: 'malformed_payload',
+          resourceType: 'raw',
+          resourceReference: 'malformed',
+          applicationId: null,
+          paymentIntentId: null,
+          routingStatus: 'rejected',
+          routingMode: 'UNRESOLVED_NO_MATCH',
+          encryptedPayload: envelope.encryptedPayload,
+          payloadNonce: envelope.payloadNonce,
+          payloadTag: envelope.payloadTag,
+          wrappedDek: envelope.wrappedDek,
+          kekVersion: 'v1',
+          payloadSha256,
+        });
+
+        logger.warn('Persisted authenticated malformed webhook as rejected', {
+          eventId: event.id,
+          dedupeKey: verification.dedupeKey,
+        });
+
+        return {
+          eventId: event.id,
+          isDuplicate,
+          routingStatus: 'rejected',
+          deliveryId: null,
+          committedAt: new Date(),
+        };
+      });
+    }
 
     return withTransaction(pool, null, async (client) => {
       // 2. Deterministic local routing resolution

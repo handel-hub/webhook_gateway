@@ -19,6 +19,7 @@
  * Verification result returned by provider adapters after evaluating raw bytes and headers.
  * @typedef {object} ProviderVerificationResult
  * @property {boolean} isValid - True if signature is cryptographically authentic.
+ * @property {boolean} [isMalformed] - True if signature was authentic but payload was malformed JSON or unsupported.
  * @property {string | null} failureReason - Descriptive reason if verification failed.
  * @property {string} dedupeKey - Canonical length-prefixed deduplication key.
  * @property {NormalizedPayload | null} normalized - Normalized event payload if authentic.

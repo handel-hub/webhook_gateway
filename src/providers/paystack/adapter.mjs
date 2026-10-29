@@ -61,9 +61,10 @@ export const PaystackAdapter = {
       parsed = JSON.parse(rawBody.toString('utf8'));
     } catch (err) {
       return {
-        isValid: false,
+        isValid: true,
+        isMalformed: true,
         failureReason: 'Malformed JSON payload.',
-        dedupeKey: 'malformed_json',
+        dedupeKey: `v1:pstk:malformed:${crypto.createHash('sha256').update(rawBody).digest('hex')}`,
         normalized: null,
       };
     }
