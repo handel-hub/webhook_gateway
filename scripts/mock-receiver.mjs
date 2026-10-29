@@ -4,7 +4,7 @@ import path from 'node:path';
 import { verifyOutboundSignature } from '../src/security/hmac-signer.mjs';
 
 /**
- * @typedef {'healthy' | 'duplicate_ack' | 'failing' | 'rate_limited' | 'slow' | 'flapping'} ReceiverMode
+ * @typedef {'healthy' | 'duplicate_ack' | 'no_content' | 'client_error' | 'rate_limited' | 'failing' | 'server_error' | 'bad_gateway' | 'service_unavailable' | 'socket_hangup' | 'massive_response' | 'slow' | 'flapping'} ReceiverMode
  */
 
 export class MockReceiver {
@@ -51,13 +51,13 @@ export class MockReceiver {
       // Control endpoints
       if (req.method === 'GET' && url.pathname === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', mode: this.mode, count: this.receivedDeliveries.length }));
+        res.end(JSON.stringify({ status: 'ok', mode: this.mode, count: this.receivedDeliveries.length, total: this.allDeliveries.length }));
         return;
       }
 
       if (req.method === 'GET' && url.pathname === '/deliveries') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ count: this.receivedDeliveries.length, deliveries: this.receivedDeliveries }));
+        res.end(JSON.stringify({ count: this.receivedDeliveries.length, total: this.allDeliveries.length, deliveries: this.receivedDeliveries }));
         return;
       }
 
@@ -87,7 +87,7 @@ export class MockReceiver {
       }
 
       // Webhook ingestion endpoint
-      if (req.method === 'POST' && (url.pathname === '/webhook' || url.pathname === '/')) {
+      if (req.method === 'POST' && (url.pathname.startsWith('/webhook') || url.pathname === '/')) {
         /** @type {Buffer[]} */
         const chunks = [];
         req.on('data', (c) => chunks.push(c));
@@ -115,36 +115,63 @@ export class MockReceiver {
             isSignatureValid,
             payload: parsedBody,
             headers: req.headers,
+            url: req.url,
             receivedAt: new Date().toISOString(),
           };
           this.receivedDeliveries.push(record);
           this.allDeliveries.push(record);
 
-          // Evaluate mock response mode
-          const effectiveMode = req.headers['x-mock-mode'] || this.mode;
+          // Evaluate mock response mode (from query param, header, or instance mode)
+          const modeFromQuery = url.searchParams.get('mode');
+          const effectiveMode = modeFromQuery || req.headers['x-mock-mode'] || this.mode;
 
-          if (effectiveMode === 'failing') {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Internal Server Error (Simulated Downstream Failure)' }));
+          // 1. Socket Hangup (abrupt drop without response)
+          if (effectiveMode === 'socket_hangup') {
+            req.socket.destroy();
             return;
           }
 
-          if (effectiveMode === 'rate_limited') {
-            res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '5' });
-            res.end(JSON.stringify({ error: 'Too Many Requests (Simulated Rate Limit)' }));
-            return;
-          }
-
+          // 2. Slow Response (12s to trigger client timeout)
           if (effectiveMode === 'slow') {
-            // Sleep 12s to trigger client timeout
             await new Promise((resolve) => setTimeout(resolve, 12000));
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'delayed_ok', deliveryId }));
             return;
           }
 
+          // 3. Client Error (HTTP 400 Bad Request - Non-Retryable)
+          if (effectiveMode === 'client_error') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Bad Request (Client Error)', message: 'Non-retryable downstream rejection' }));
+            return;
+          }
+
+          // 4. Rate Limited (HTTP 429 Too Many Requests with Retry-After)
+          if (effectiveMode === 'rate_limited') {
+            res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '3' });
+            res.end(JSON.stringify({ error: 'Too Many Requests', retryAfter: 3 }));
+            return;
+          }
+
+          // 5. Server Errors (500, 502, 503)
+          if (effectiveMode === 'failing' || effectiveMode === 'server_error') {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Internal Server Error (Simulated Downstream Failure)' }));
+            return;
+          }
+          if (effectiveMode === 'bad_gateway') {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Bad Gateway' }));
+            return;
+          }
+          if (effectiveMode === 'service_unavailable') {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Service Unavailable' }));
+            return;
+          }
+
+          // 6. Flapping (fails 5 times, then succeeds)
           if (effectiveMode === 'flapping') {
-            // Fail first 5 times, then succeed
             if (this.consecutiveRequests <= 5) {
               res.writeHead(503, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: `Flapping failure ${this.consecutiveRequests}/5` }));
@@ -152,13 +179,29 @@ export class MockReceiver {
             }
           }
 
+          // 7. No Content (HTTP 204)
+          if (effectiveMode === 'no_content') {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+
+          // 8. Massive Response Body (100 KB to verify 2,048-byte streaming truncation)
+          if (effectiveMode === 'massive_response') {
+            const bigData = 'X'.repeat(1024 * 100);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'processed', deliveryId, payloadBlob: bigData }));
+            return;
+          }
+
+          // 9. Duplicate Acknowledged
           if (effectiveMode === 'duplicate_ack') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'duplicate_acknowledged', deliveryId }));
             return;
           }
 
-          // Default: healthy 200 OK with envelope
+          // 10. Default: Healthy processed 200 OK
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ status: 'processed', deliveryId, acknowledgedAt: new Date().toISOString() }));
         });
