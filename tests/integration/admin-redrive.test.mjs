@@ -4,162 +4,16 @@ import express from 'express';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { createAdminRouter } from '../../src/admin/admin-server.mjs';
+import {
+  getTestPool,
+  closeTestPool,
+  createTestApp,
+  createTestEndpoint,
+  createTestProviderConnection,
+  cleanupTestTenants,
+} from '../helpers/db-test-helper.mjs';
 
-function createMockAdminPool() {
-  /** @type {Map<string, any>} */
-  const applications = new Map();
-  /** @type {Map<string, any>} */
-  const endpoints = new Map();
-  /** @type {Map<string, any>} */
-  const events = new Map();
-  /** @type {Map<string, any>} */
-  const deliveries = new Map();
-  /** @type {any[]} */
-  const auditEvents = [];
-
-  const client = {
-    /**
-     * @param {string} sql
-     * @param {any[]} [params]
-     */
-    async query(sql, params = []) {
-      const s = sql.replace(/\s+/g, ' ').trim().toUpperCase();
-
-      if (s.startsWith('BEGIN') || s.startsWith('COMMIT') || s.startsWith('ROLLBACK')) {
-        return { rows: [] };
-      }
-
-      if (s.includes('SET_CONFIG')) {
-        return { rows: [] };
-      }
-
-      // Application insert
-      if (s.includes('INSERT INTO CWIDS.APPLICATIONS')) {
-        const [id, code, name, apiKeyHash] = params;
-        const app = {
-          id: id ?? crypto.randomUUID(),
-          code,
-          name,
-          api_key_hash: apiKeyHash,
-          status: 'active',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        };
-        applications.set(app.id, app);
-        return { rows: [app] };
-      }
-
-      // Endpoint version query
-      if (s.includes('FROM CWIDS.DESTINATION_ENDPOINTS') && s.includes('NEXT_VERSION')) {
-        return { rows: [{ next_version: 1 }] };
-      }
-
-      // Endpoint insert
-      if (s.includes('INSERT INTO CWIDS.DESTINATION_ENDPOINTS')) {
-        const [applicationId, version, url, signingSecret, timeoutMs, maxRetries] = params;
-        const ep = {
-          id: crypto.randomUUID(),
-          application_id: applicationId,
-          version,
-          url,
-          signing_secret: signingSecret,
-          http_timeout_ms: timeoutMs,
-          max_retries: maxRetries,
-          status: 'active',
-          created_at: new Date().toISOString(),
-        };
-        endpoints.set(ep.id, ep);
-        return { rows: [ep] };
-      }
-
-      // Query event by ID
-      if (s.includes('FROM CWIDS.WEBHOOK_EVENTS') && s.includes('WHERE ID = $1')) {
-        const ev = events.get(params[0]);
-        return { rows: ev ? [ev] : [] };
-      }
-
-      // Find active endpoint for application
-      if (s.includes('FROM CWIDS.DESTINATION_ENDPOINTS') && s.includes('APPLICATION_ID = $1')) {
-        const appId = params[0];
-        const match = Array.from(endpoints.values()).find(
-          (ep) => ep.application_id === appId && ep.status === 'active',
-        );
-        return { rows: match ? [match] : [] };
-      }
-
-      // Update event routing status
-      if (s.includes('UPDATE CWIDS.WEBHOOK_EVENTS') && s.includes("SET ROUTING_STATUS = 'RESOLVED'")) {
-        const [appId, evId] = params;
-        const ev = events.get(evId);
-        if (ev) {
-          ev.routing_status = 'resolved';
-          ev.application_id = appId;
-        }
-        return { rows: [] };
-      }
-
-      // Insert delivery
-      if (s.includes('INSERT INTO CWIDS.EVENT_DELIVERIES')) {
-        const [id, eventId, applicationId, destinationEndpointId] = params;
-        const deliv = {
-          id: id ?? crypto.randomUUID(),
-          event_id: eventId,
-          application_id: applicationId,
-          destination_endpoint_id: destinationEndpointId,
-          status: 'pending',
-          attempt_count: 0,
-          fencing_token: 0,
-          next_attempt_at: new Date(),
-        };
-        deliveries.set(deliv.id, deliv);
-        return { rows: [deliv] };
-      }
-
-      // Find delivery by ID
-      if (s.includes('FROM CWIDS.EVENT_DELIVERIES') && s.includes('WHERE ID = $1')) {
-        const deliv = deliveries.get(params[0]);
-        return { rows: deliv ? [deliv] : [] };
-      }
-
-      // Redrive delivery: UPDATE event_deliveries SET status = 'pending', fencing_token = fencing_token + 1
-      if (s.includes('UPDATE CWIDS.EVENT_DELIVERIES') && s.includes("STATUS = 'DEAD_LETTERED'")) {
-        const deliv = deliveries.get(params[0]);
-        if (deliv && deliv.status === 'dead_lettered') {
-          deliv.status = 'pending';
-          deliv.fencing_token += 1;
-          deliv.next_attempt_at = new Date();
-          return { rows: [deliv] };
-        }
-        return { rows: [] };
-      }
-
-      // Audit events & outbox insert
-      if (s.includes('INSERT INTO CWIDS.ADMINISTRATIVE_AUDIT_EVENTS')) {
-        const audit = { id: params[0] ?? crypto.randomUUID() };
-        auditEvents.push(audit);
-        return { rows: [audit] };
-      }
-
-      if (s.includes('INSERT INTO CWIDS.AUDIT_OUTBOX')) {
-        return { rows: [{ id: auditEvents.length }] };
-      }
-
-      throw new Error(`Unhandled SQL: ${sql}`);
-    },
-    release() {},
-  };
-
-  return {
-    applications,
-    endpoints,
-    events,
-    deliveries,
-    auditEvents,
-    async connect() {
-      return client;
-    },
-  };
-}
+const ADMIN_TOKEN = 'secret_admin_token_length_32_ok_long';
 
 /**
  * @param {import('express').Router} router
@@ -186,123 +40,188 @@ async function startTestServer(router) {
   };
 }
 
-const ADMIN_TOKEN = 'secret_admin_token_length_32_ok';
-
-test('Admin API: rejects requests without valid Admin Bearer token', async () => {
-  const mockPool = createMockAdminPool();
-  const router = createAdminRouter({ pool: /** @type {any} */ (mockPool), adminApiToken: ADMIN_TOKEN });
-  const { baseUrl, close } = await startTestServer(router);
-
-  try {
-    const res = await fetch(`${baseUrl}/applications`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: 'app_1', name: 'App 1' }),
-    });
-
-    assert.equal(res.status, 401);
-  } finally {
-    await close();
-  }
-});
-
-test('Admin API: registers application and generates raw API key', async () => {
-  const mockPool = createMockAdminPool();
-  const router = createAdminRouter({ pool: /** @type {any} */ (mockPool), adminApiToken: ADMIN_TOKEN });
-  const { baseUrl, close } = await startTestServer(router);
+test('Admin API & Redrive: Real PostgreSQL Integration Suite', async (t) => {
+  const pool = getTestPool();
+  /** @type {string[]} */
+  const createdAppIds = [];
+  /** @type {any} */
+  let testServer;
 
   try {
-    const res = await fetch(`${baseUrl}/applications`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ADMIN_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ code: 'fintech_app', name: 'Fintech Core' }),
+    const router = createAdminRouter({ pool, adminApiToken: ADMIN_TOKEN });
+    testServer = await startTestServer(router);
+    const baseUrl = testServer.baseUrl;
+
+    const baseApp = await createTestApp(pool, { name: 'Admin Suite App' });
+    createdAppIds.push(baseApp.id);
+    const endpoint = await createTestEndpoint(pool, baseApp.id, {
+      url: 'https://example.com/webhook-admin',
+    });
+    const conn = await createTestProviderConnection(pool, { applicationId: baseApp.id });
+
+    await t.test('Admin API: rejects requests without valid Admin Bearer token', async () => {
+      const res = await fetch(`${baseUrl}/applications`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: 'app_noauth', name: 'No Auth App' }),
+      });
+
+      assert.equal(res.status, 401);
     });
 
-    assert.equal(res.status, 201);
-    const body = await res.json();
-    assert.equal(body.code, 'fintech_app');
-    assert.equal(body.name, 'Fintech Core');
-    assert.ok(body.api_key.startsWith('cwids_'));
+    await t.test('Admin API: registers application and generates raw API key', async () => {
+      const code = `app_${crypto.randomBytes(4).toString('hex')}`;
+      const res = await fetch(`${baseUrl}/applications`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ADMIN_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ code, name: 'Fintech Core' }),
+      });
+
+      assert.equal(res.status, 201);
+      const body = await res.json();
+      assert.equal(body.code, code);
+      assert.equal(body.name, 'Fintech Core');
+      assert.ok(body.api_key.startsWith('cwids_'));
+      createdAppIds.push(body.id);
+
+      // Verify row exists in real database
+      const appRow = await pool.query(`SELECT * FROM cwids.applications WHERE id = $1`, [body.id]);
+      assert.equal(appRow.rows.length, 1);
+      assert.equal(appRow.rows[0].code, code);
+    });
+
+    await t.test('Admin API: manual redrive transitions dead_lettered to pending with incremented fencing token', async () => {
+      // 1. Seed an event
+      const dedupeKey = `admin-redrive-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      const evRes = await pool.query(
+        `INSERT INTO cwids.webhook_events 
+           (application_id, provider_connection_id, provider, environment, identity_strategy_version, dedupe_key, event_type, resource_type, resource_reference, routing_status, routing_mode, kek_version, payload_sha256)
+         VALUES ($1, $2, $3, $4, 1, $5, 'charge.success', 'charge', 'ref-admin', 'resolved', 'mode_a', 'v1', 'dummy_sha')
+         RETURNING id`,
+        [baseApp.id, conn.id, conn.provider, conn.environment, dedupeKey],
+      );
+      const eventId = evRes.rows[0].id;
+
+      // 2. Seed a dead-lettered delivery
+      const delivRes = await pool.query(
+        `INSERT INTO cwids.event_deliveries
+         (id, event_id, application_id, destination_endpoint_id, status, attempt_count, fencing_token, epoch_id, epoch_attempt_count, redrive_count, terminal_reason)
+         VALUES
+         (gen_random_uuid(), $1, $2, $3, 'dead_lettered', 15, 15, gen_random_uuid(), 15, 0, 'MAX_RETRIES_EXCEEDED')
+         RETURNING id`,
+        [eventId, baseApp.id, endpoint.id],
+      );
+      const deliveryId = delivRes.rows[0].id;
+
+      // 3. Execute redrive via Admin API
+      const res = await fetch(`${baseUrl}/deliveries/${deliveryId}/redrive`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ADMIN_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason: 'Destination service recovered from outage' }),
+      });
+
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.delivery_id, deliveryId);
+      assert.equal(body.event_id, eventId);
+      assert.equal(body.status, 'pending');
+      assert.equal(Number(body.fencing_token), 16); // Incremented!
+      assert.equal(Number(body.attempt_count), 15); // Monotonic total attempt history preserved!
+      assert.equal(Number(body.epoch_attempt_count), 0); // New epoch attempt reset!
+      assert.equal(Number(body.redrive_count), 1); // Redrive counter incremented!
+      assert.ok(body.redrive_audit_id); // Audit logged!
+
+      // Verify directly in DB
+      const dbCheck = await pool.query(`SELECT * FROM cwids.event_deliveries WHERE id = $1`, [deliveryId]);
+      assert.equal(dbCheck.rows[0].status, 'pending');
+      assert.equal(Number(dbCheck.rows[0].fencing_token), 16);
+      assert.equal(Number(dbCheck.rows[0].attempt_count), 15);
+      assert.equal(Number(dbCheck.rows[0].epoch_attempt_count), 0);
+      assert.equal(Number(dbCheck.rows[0].redrive_count), 1);
+      assert.equal(dbCheck.rows[0].terminal_reason, null);
+    });
+
+    await t.test('Admin API: manual redrive on active/delivered delivery returns 409 Conflict', async () => {
+      const dedupeKey = `admin-delivered-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      const evRes = await pool.query(
+        `INSERT INTO cwids.webhook_events 
+           (application_id, provider_connection_id, provider, environment, identity_strategy_version, dedupe_key, event_type, resource_type, resource_reference, routing_status, routing_mode, kek_version, payload_sha256)
+         VALUES ($1, $2, $3, $4, 1, $5, 'charge.success', 'charge', 'ref-admin-2', 'resolved', 'mode_a', 'v1', 'dummy_sha')
+         RETURNING id`,
+        [baseApp.id, conn.id, conn.provider, conn.environment, dedupeKey],
+      );
+      const eventId = evRes.rows[0].id;
+
+      const delivRes = await pool.query(
+        `INSERT INTO cwids.event_deliveries
+         (id, event_id, application_id, destination_endpoint_id, status, attempt_count, fencing_token)
+         VALUES
+         (gen_random_uuid(), $1, $2, $3, 'delivered', 1, 1)
+         RETURNING id`,
+        [eventId, baseApp.id, endpoint.id],
+      );
+      const deliveryId = delivRes.rows[0].id;
+
+      const res = await fetch(`${baseUrl}/deliveries/${deliveryId}/redrive`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ADMIN_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ reason: 'Retry test' }),
+      });
+
+      assert.equal(res.status, 409);
+      const body = await res.json();
+      assert.equal(body.code, 'INVALID_STATE');
+    });
+
+    await t.test('Admin API: POST /v1/admin/events/:id/resolve manually routes awaiting_route event', async () => {
+      const dedupeKey = `admin-awaiting-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      const evRes = await pool.query(
+        `INSERT INTO cwids.webhook_events 
+           (provider_connection_id, provider, environment, identity_strategy_version, dedupe_key, event_type, resource_type, resource_reference, routing_status, routing_mode, kek_version, payload_sha256)
+         VALUES ($1, $2, $3, 1, $4, 'charge.success', 'charge', 'ref-awaiting', 'awaiting_route', 'UNRESOLVED_NO_MATCH', 'v1', 'dummy_sha')
+         RETURNING id`,
+        [conn.id, conn.provider, conn.environment, dedupeKey],
+      );
+      const eventId = evRes.rows[0].id;
+
+      const res = await fetch(`${baseUrl}/events/${eventId}/resolve`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ADMIN_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ application_id: baseApp.id, reason: 'Manual ops resolution' }),
+      });
+
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.status, 'success');
+
+      // Verify event is resolved and delivery obligation created
+      const evCheck = await pool.query(`SELECT routing_status, application_id FROM cwids.webhook_events WHERE id = $1`, [eventId]);
+      assert.equal(evCheck.rows[0].routing_status, 'resolved');
+      assert.equal(evCheck.rows[0].application_id, baseApp.id);
+
+      const delivCheck = await pool.query(`SELECT status FROM cwids.event_deliveries WHERE event_id = $1`, [eventId]);
+      assert.equal(delivCheck.rows.length, 1);
+      assert.equal(delivCheck.rows[0].status, 'pending');
+    });
   } finally {
-    await close();
-  }
-});
-
-test('Admin API: manual redrive transitions dead_lettered to pending with incremented fencing token', async () => {
-  const mockPool = createMockAdminPool();
-  const router = createAdminRouter({ pool: /** @type {any} */ (mockPool), adminApiToken: ADMIN_TOKEN });
-  const { baseUrl, close } = await startTestServer(router);
-
-  try {
-    // Seed a dead-lettered delivery
-    const deliveryId = 'deliv_dlq_123';
-    mockPool.deliveries.set(deliveryId, {
-      id: deliveryId,
-      event_id: 'evt_123',
-      application_id: 'app_999',
-      destination_endpoint_id: 'ep_1',
-      status: 'dead_lettered',
-      attempt_count: 15,
-      fencing_token: 15,
-      next_attempt_at: new Date(),
-    });
-
-    // Execute redrive
-    const res = await fetch(`${baseUrl}/deliveries/${deliveryId}/redrive`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ADMIN_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ reason: 'Destination service recovered from outage' }),
-    });
-
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.equal(body.delivery_id, deliveryId);
-    assert.equal(body.event_id, 'evt_123');
-    assert.equal(body.status, 'pending');
-    assert.equal(body.fencing_token, 16); // Incremented!
-    assert.equal(body.attempt_count, 15); // History preserved!
-    assert.ok(body.redrive_audit_id); // Audit logged!
-  } finally {
-    await close();
-  }
-});
-
-test('Admin API: manual redrive on active/delivered delivery returns 409 Conflict', async () => {
-  const mockPool = createMockAdminPool();
-  const router = createAdminRouter({ pool: /** @type {any} */ (mockPool), adminApiToken: ADMIN_TOKEN });
-  const { baseUrl, close } = await startTestServer(router);
-
-  try {
-    const deliveryId = 'deliv_already_delivered';
-    mockPool.deliveries.set(deliveryId, {
-      id: deliveryId,
-      event_id: 'evt_123',
-      application_id: 'app_999',
-      destination_endpoint_id: 'ep_1',
-      status: 'delivered', // Not dead_lettered!
-      attempt_count: 1,
-      fencing_token: 1,
-    });
-
-    const res = await fetch(`${baseUrl}/deliveries/${deliveryId}/redrive`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ADMIN_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ reason: 'Retry test' }),
-    });
-
-    assert.equal(res.status, 409);
-    const body = await res.json();
-    assert.equal(body.code, 'INVALID_STATE');
-  } finally {
-    await close();
+    if (testServer) {
+      await testServer.close();
+    }
+    if (createdAppIds.length > 0) {
+      await cleanupTestTenants(pool, createdAppIds);
+    }
+    await closeTestPool();
   }
 });

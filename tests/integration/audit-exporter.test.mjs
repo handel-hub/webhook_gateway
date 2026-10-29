@@ -1,77 +1,72 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { AuditExporter } from '../../src/maintenance/audit-exporter.mjs';
+import {
+  getTestPool,
+  closeTestPool,
+  createTestApp,
+  cleanupTestTenants,
+} from '../helpers/db-test-helper.mjs';
 
-function createMockOutboxPool() {
-  /** @type {Map<number, any>} */
-  const outbox = new Map([
-    [1, { id: 1, auditEventId: 'evt_1', payload: { action: 'app.create' }, status: 'pending' }],
-    [2, { id: 2, auditEventId: 'evt_2', payload: { action: 'delivery.redrive' }, status: 'pending' }],
-  ]);
+test('AuditExporter: Real PostgreSQL Integration Suite', async () => {
+  const pool = getTestPool();
+  let appId = '';
 
-  const client = {
-    /**
-     * @param {string} sql
-     * @param {any[]} [params]
-     */
-    async query(sql, params = []) {
-      const s = sql.replace(/\s+/g, ' ').trim().toUpperCase();
+  try {
+    const app = await createTestApp(pool, { name: 'Audit Exporter App' });
+    appId = app.id;
 
-      if (s.startsWith('BEGIN') || s.startsWith('COMMIT') || s.startsWith('ROLLBACK')) {
-        return { rows: [] };
-      }
+    // 1. Seed 2 administrative audit events and 2 outbox entries in 'pending' status
+    /** @type {number[]} */
+    const outboxIds = [];
+    for (let i = 1; i <= 2; i++) {
+      const auditRes = await pool.query(
+        `INSERT INTO cwids.administrative_audit_events
+           (id, actor_identity, application_id, action, target_type, target_id, request_id, outcome, audit_class, legal_hold)
+         VALUES
+           (gen_random_uuid(), 'admin', $1, $2, 'application', $3, gen_random_uuid(), 'success', 'operational', false)
+         RETURNING id`,
+        [appId, `test.action.${i}`, appId],
+      );
+      const auditId = auditRes.rows[0].id;
 
-      // AuditOutboxRepo.fetchPending
-      if (s.includes('FROM CWIDS.AUDIT_OUTBOX') && s.includes("STATUS = 'PENDING'")) {
-        const limit = params[0] ?? 100;
-        const pending = Array.from(outbox.values())
-          .filter((row) => row.status === 'pending')
-          .slice(0, limit);
-        return { rows: pending };
-      }
+      const outboxRes = await pool.query(
+        `INSERT INTO cwids.audit_outbox
+           (audit_event_id, payload, status)
+         VALUES
+           ($1, $2, 'pending')
+         RETURNING id`,
+        [auditId, JSON.stringify({ action: `test.action.${i}`, appId })],
+      );
+      outboxIds.push(Number(outboxRes.rows[0].id));
+    }
 
-      // AuditOutboxRepo.markExported
-      if (s.includes('UPDATE CWIDS.AUDIT_OUTBOX') && s.includes("SET STATUS = 'EXPORTED'")) {
-        const ids = params[0];
-        let count = 0;
-        for (const id of ids) {
-          const row = outbox.get(Number(id));
-          if (row) {
-            row.status = 'exported';
-            count++;
-          }
-        }
-        return { rowCount: count };
-      }
+    /** @type {any[]} */
+    const exported = [];
 
-      throw new Error(`Unhandled SQL: ${sql}`);
-    },
-    release() {},
-  };
+    // 2. Export batch
+    const count = await AuditExporter.exportBatch(pool, 10, (rec) => {
+      exported.push(rec);
+    });
 
-  return {
-    outbox,
-    async connect() {
-      return client;
-    },
-  };
-}
+    assert.ok(count >= 2, 'Should export at least 2 records');
+    const matched = exported.filter((e) => outboxIds.includes(Number(e.id)));
+    assert.equal(matched.length, 2);
 
-test('AuditExporter: drains pending outbox records and marks them exported', async () => {
-  const mockPool = createMockOutboxPool();
-  /** @type {any[]} */
-  const exported = [];
-
-  const count = await AuditExporter.exportBatch(/** @type {any} */ (mockPool), 10, (rec) => {
-    exported.push(rec);
-  });
-
-  assert.equal(count, 2);
-  assert.equal(exported.length, 2);
-  assert.equal(exported[0].id, 1);
-  assert.equal(exported[1].id, 2);
-
-  // Assert outbox rows marked exported in DB
-  assert.equal(mockPool.outbox.get(1)?.status, 'exported');
-  assert.equal(mockPool.outbox.get(2)?.status, 'exported');
+    // 3. Assert outbox rows are marked as 'exported' in real DB
+    const checkOutbox = await pool.query(
+      `SELECT id, status FROM cwids.audit_outbox WHERE id = ANY($1::bigint[])`,
+      [outboxIds],
+    );
+    assert.equal(checkOutbox.rows.length, 2);
+    for (const row of checkOutbox.rows) {
+      assert.equal(row.status, 'exported');
+    }
+  } finally {
+    if (appId) {
+      await cleanupTestTenants(pool, [appId]);
+    }
+    await closeTestPool();
+  }
 });

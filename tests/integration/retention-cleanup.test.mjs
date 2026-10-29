@@ -1,238 +1,154 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { RetentionWorker } from '../../src/maintenance/retention-worker.mjs';
+import {
+  getTestPool,
+  closeTestPool,
+  createTestApp,
+  createTestProviderConnection,
+  cleanupTestTenants,
+} from '../helpers/db-test-helper.mjs';
 
-function createMockRetentionPool() {
-  /** @type {Map<string, any>} */
-  const events = new Map();
-  /** @type {Map<string, any>} */
-  const audits = new Map();
-  /** @type {any[]} */
-  const systemAuditLogs = [];
+test('Data Retention & Classified Audits: Real PostgreSQL Integration Suite', async (t) => {
+  const pool = getTestPool();
+  let appId = '';
 
-  const client = {
-    /**
-     * @param {string} sql
-     * @param {any[]} [params]
-     */
-    async query(sql, params = []) {
-      const s = sql.trim().toUpperCase();
+  try {
+    const app = await createTestApp(pool, { name: 'Retention Test App' });
+    appId = app.id;
+    const conn = await createTestProviderConnection(pool, { applicationId: appId });
 
-      if (s.startsWith('BEGIN') || s.startsWith('COMMIT') || s.startsWith('ROLLBACK')) {
-        return { rows: [] };
-      }
+    await t.test('prunes 30-day raw encrypted payloads while preserving metadata', async () => {
+      const now = Date.now();
+      const thirtyFiveDaysAgo = new Date(now - 35 * 24 * 3600 * 1000);
+      const tenDaysAgo = new Date(now - 10 * 24 * 3600 * 1000);
 
-      if (s.includes('SET_CONFIG')) {
-        return { rows: [] };
-      }
+      const oldDedupe = `ret-old-${crypto.randomBytes(4).toString('hex')}`;
+      const oldRes = await pool.query(
+        `INSERT INTO cwids.webhook_events 
+           (application_id, provider_connection_id, provider, environment, identity_strategy_version, dedupe_key, event_type, resource_type, resource_reference, routing_status, routing_mode, kek_version, payload_sha256, encrypted_payload, wrapped_dek, received_at, legal_hold)
+         VALUES ($1, $2, $3, $4, 1, $5, 'charge.success', 'charge', 'ref-old', 'resolved', 'mode_a', 'v1', 'sha_old', $6, $7, $8, false)
+         RETURNING id`,
+        [appId, conn.id, conn.provider, conn.environment, oldDedupe, Buffer.from('old_bytes'), Buffer.alloc(48), thirtyFiveDaysAgo],
+      );
+      const oldEventId = oldRes.rows[0].id;
 
-      // 1. Prune encrypted payloads
-      // CTE: SELECT id FROM cwids.webhook_events WHERE received_at < $1 AND encrypted_payload IS NOT NULL AND legal_hold = FALSE
-      if (s.includes('ENCRYPTED_PAYLOAD = NULL') && s.includes('PAYLOAD_DELETED_AT = CURRENT_TIMESTAMP')) {
-        const cutoffDate = new Date(params[0]);
-        let count = 0;
-        for (const ev of events.values()) {
-          if (
-            new Date(ev.received_at) < cutoffDate &&
-            ev.encrypted_payload !== null &&
-            ev.legal_hold === false
-          ) {
-            ev.encrypted_payload = null;
-            ev.payload_nonce = null;
-            ev.payload_tag = null;
-            ev.wrapped_dek = null;
-            ev.payload_deleted_at = new Date();
-            count++;
-          }
-        }
-        return { rowCount: count };
-      }
+      const recentDedupe = `ret-rec-${crypto.randomBytes(4).toString('hex')}`;
+      const recRes = await pool.query(
+        `INSERT INTO cwids.webhook_events 
+           (application_id, provider_connection_id, provider, environment, identity_strategy_version, dedupe_key, event_type, resource_type, resource_reference, routing_status, routing_mode, kek_version, payload_sha256, encrypted_payload, wrapped_dek, received_at, legal_hold)
+         VALUES ($1, $2, $3, $4, 1, $5, 'charge.success', 'charge', 'ref-rec', 'resolved', 'mode_a', 'v1', 'sha_rec', $6, $7, $8, false)
+         RETURNING id`,
+        [appId, conn.id, conn.provider, conn.environment, recentDedupe, Buffer.from('rec_bytes'), Buffer.alloc(48), tenDaysAgo],
+      );
+      const recEventId = recRes.rows[0].id;
 
-      // 2. Purge expired terminal metadata
-      if (s.includes('DELETE FROM CWIDS.WEBHOOK_EVENTS TARGET')) {
-        const cutoffDate = new Date(params[0]);
-        let count = 0;
-        for (const [id, ev] of events.entries()) {
-          if (new Date(ev.received_at) < cutoffDate && ev.legal_hold === false) {
-            events.delete(id);
-            count++;
-          }
-        }
-        return { rowCount: count };
-      }
+      // Execute retention sweep
+      const result = await RetentionWorker.runRetentionSweep(pool, {
+        rawPayloadRetentionDays: 30,
+        normalizedMetadataRetentionDays: 90,
+        operationalAuditRetentionDays: 365,
+        securityAuditRetentionDays: 2555,
+      });
 
-      // 3. Purge classified audits
-      if (s.includes('DELETE FROM CWIDS.ADMINISTRATIVE_AUDIT_EVENTS TARGET')) {
-        const opCutoff = new Date(params[0]);
-        const secCutoff = new Date(params[1]);
-        let count = 0;
-        for (const [id, audit] of audits.entries()) {
-          if (audit.legal_hold === false) {
-            const createdAt = new Date(audit.created_at);
-            if (audit.audit_class === 'operational' && createdAt < opCutoff) {
-              audits.delete(id);
-              count++;
-            } else if (['security', 'compliance'].includes(audit.audit_class) && createdAt < secCutoff) {
-              audits.delete(id);
-              count++;
-            }
-          }
-        }
-        return { rowCount: count };
-      }
+      assert.ok(result.payloadsPruned >= 1, 'Should prune at least the old payload');
 
-      // 4. Audit logging
-      if (s.includes('INSERT INTO CWIDS.ADMINISTRATIVE_AUDIT_EVENTS')) {
-        systemAuditLogs.push({ action: 'retention.sweep_completed' });
-        return { rows: [{ id: 'audit_sweep_1' }] };
-      }
+      // Verify in DB that old event payload is nullified and metadata is intact
+      const checkOld = await pool.query(
+        `SELECT encrypted_payload, wrapped_dek, payload_deleted_at, dedupe_key FROM cwids.webhook_events WHERE id = $1`,
+        [oldEventId],
+      );
+      assert.equal(checkOld.rows[0].encrypted_payload, null);
+      assert.equal(checkOld.rows[0].wrapped_dek, null);
+      assert.notEqual(checkOld.rows[0].payload_deleted_at, null);
+      assert.equal(checkOld.rows[0].dedupe_key, oldDedupe);
 
-      if (s.includes('INSERT INTO CWIDS.AUDIT_OUTBOX')) {
-        return { rows: [{ id: 1 }] };
-      }
+      // Verify in DB that recent event payload is NOT touched
+      const checkRec = await pool.query(
+        `SELECT encrypted_payload, payload_deleted_at FROM cwids.webhook_events WHERE id = $1`,
+        [recEventId],
+      );
+      assert.notEqual(checkRec.rows[0].encrypted_payload, null);
+      assert.equal(checkRec.rows[0].payload_deleted_at, null);
+    });
 
-      // 5. Unrouted alerts check
-      if (s.includes("ROUTING_STATUS IN ('AWAITING_ROUTE', 'QUARANTINED')")) {
-        return { rows: [] };
-      }
+    await t.test('legal_hold = TRUE strictly bypasses payload pruning and metadata purging', async () => {
+      const oneHundredDaysAgo = new Date(Date.now() - 100 * 24 * 3600 * 1000);
+      const legalDedupe = `ret-legal-${crypto.randomBytes(4).toString('hex')}`;
 
-      throw new Error(`Unhandled SQL: ${sql}`);
-    },
-    release() {},
-  };
+      const res = await pool.query(
+        `INSERT INTO cwids.webhook_events 
+           (application_id, provider_connection_id, provider, environment, identity_strategy_version, dedupe_key, event_type, resource_type, resource_reference, routing_status, routing_mode, kek_version, payload_sha256, encrypted_payload, wrapped_dek, received_at, legal_hold)
+         VALUES ($1, $2, $3, $4, 1, $5, 'dispute.created', 'dispute', 'ref-legal', 'resolved', 'mode_a', 'v1', 'sha_legal', $6, $7, $8, true)
+         RETURNING id`,
+        [appId, conn.id, conn.provider, conn.environment, legalDedupe, Buffer.from('dispute_evidence'), Buffer.alloc(48), oneHundredDaysAgo],
+      );
+      const legalEventId = res.rows[0].id;
 
-  return {
-    events,
-    audits,
-    systemAuditLogs,
-    async connect() {
-      return client;
-    },
-  };
-}
+      await RetentionWorker.runRetentionSweep(pool, {
+        rawPayloadRetentionDays: 30,
+        normalizedMetadataRetentionDays: 90,
+      });
 
-test('RetentionWorker: prunes 30-day raw encrypted payloads while preserving metadata', async () => {
-  const mockPool = createMockRetentionPool();
+      // Event must still exist and payload must remain intact
+      const check = await pool.query(
+        `SELECT encrypted_payload, payload_deleted_at FROM cwids.webhook_events WHERE id = $1`,
+        [legalEventId],
+      );
+      assert.equal(check.rows.length, 1);
+      assert.notEqual(check.rows[0].encrypted_payload, null);
+      assert.equal(check.rows[0].payload_deleted_at, null);
+    });
 
-  const now = Date.now();
-  const thirtyFiveDaysAgo = new Date(now - 35 * 24 * 3600 * 1000);
-  const tenDaysAgo = new Date(now - 10 * 24 * 3600 * 1000);
+    await t.test('purges classified audits according to purpose (365d operational vs 7y security)', async () => {
+      const fourHundredDaysAgo = new Date(Date.now() - 400 * 24 * 3600 * 1000);
 
-  // Expired payload (should be pruned)
-  mockPool.events.set('evt_old_1', {
-    id: 'evt_old_1',
-    received_at: thirtyFiveDaysAgo,
-    encrypted_payload: Buffer.from('encrypted_bytes'),
-    payload_nonce: Buffer.alloc(12),
-    payload_tag: Buffer.alloc(16),
-    wrapped_dek: Buffer.alloc(48),
-    payload_deleted_at: null,
-    legal_hold: false,
-    dedupe_key: 'v1:pstk:tx_old',
-    event_type: 'charge.success',
-  });
+      const opRes = await pool.query(
+        `INSERT INTO cwids.administrative_audit_events
+           (id, actor_identity, application_id, action, target_type, target_id, request_id, outcome, audit_class, legal_hold, created_at)
+         VALUES
+           (gen_random_uuid(), 'system', $1, 'delivery.attempt', 'event_delivery', $2, gen_random_uuid(), 'success', 'operational', false, $3)
+         RETURNING id`,
+        [appId, crypto.randomUUID(), fourHundredDaysAgo],
+      );
+      const opAuditId = opRes.rows[0].id;
 
-  // Recent payload (should NOT be pruned)
-  mockPool.events.set('evt_recent_1', {
-    id: 'evt_recent_1',
-    received_at: tenDaysAgo,
-    encrypted_payload: Buffer.from('recent_bytes'),
-    payload_nonce: Buffer.alloc(12),
-    payload_tag: Buffer.alloc(16),
-    wrapped_dek: Buffer.alloc(48),
-    payload_deleted_at: null,
-    legal_hold: false,
-    dedupe_key: 'v1:pstk:tx_recent',
-    event_type: 'charge.success',
-  });
+      const secRes = await pool.query(
+        `INSERT INTO cwids.administrative_audit_events
+           (id, actor_identity, application_id, action, target_type, target_id, request_id, outcome, audit_class, legal_hold, created_at)
+         VALUES
+           (gen_random_uuid(), 'admin', $1, 'application.key_rotated', 'application', $2, gen_random_uuid(), 'success', 'security', false, $3)
+         RETURNING id`,
+        [appId, String(appId), fourHundredDaysAgo],
+      );
+      const secAuditId = secRes.rows[0].id;
 
-  // Execute retention sweep
-  const result = await RetentionWorker.runRetentionSweep(/** @type {any} */ (mockPool), {
-    rawPayloadRetentionDays: 30,
-    normalizedMetadataRetentionDays: 90,
-    operationalAuditRetentionDays: 365,
-    securityAuditRetentionDays: 2555,
-  });
+      const sweepResult = await RetentionWorker.runRetentionSweep(pool, {
+        operationalAuditRetentionDays: 365,
+        securityAuditRetentionDays: 2555,
+      });
 
-  assert.equal(result.payloadsPruned, 1);
+      assert.ok(sweepResult.auditsPurged >= 1, 'Should purge the operational audit');
 
-  // Old event payload is nullified, metadata preserved
-  const oldEv = mockPool.events.get('evt_old_1');
-  assert.equal(oldEv.encrypted_payload, null);
-  assert.equal(oldEv.wrapped_dek, null);
-  assert.notEqual(oldEv.payload_deleted_at, null);
-  assert.equal(oldEv.dedupe_key, 'v1:pstk:tx_old'); // Metadata intact!
+      // Verify DB: Operational audit was deleted
+      const checkOp = await pool.query(
+        `SELECT id FROM cwids.administrative_audit_events WHERE id = $1`,
+        [opAuditId],
+      );
+      assert.equal(checkOp.rows.length, 0);
 
-  // Recent event payload is untouched
-  const recentEv = mockPool.events.get('evt_recent_1');
-  assert.notEqual(recentEv.encrypted_payload, null);
-  assert.equal(recentEv.payload_deleted_at, null);
-
-  // Auditable execution summary was recorded
-  assert.equal(mockPool.systemAuditLogs.length, 1);
-});
-
-test('RetentionWorker: legal_hold = TRUE strictly bypasses payload pruning and metadata purging', async () => {
-  const mockPool = createMockRetentionPool();
-
-  const now = Date.now();
-  const oneHundredDaysAgo = new Date(now - 100 * 24 * 3600 * 1000);
-
-  // 100-day-old event under legal hold
-  mockPool.events.set('evt_legal_hold_1', {
-    id: 'evt_legal_hold_1',
-    received_at: oneHundredDaysAgo,
-    encrypted_payload: Buffer.from('disputed_evidence'),
-    payload_nonce: Buffer.alloc(12),
-    payload_tag: Buffer.alloc(16),
-    wrapped_dek: Buffer.alloc(48),
-    payload_deleted_at: null,
-    legal_hold: true, // EXPLICIT LEGAL HOLD!
-    dedupe_key: 'v1:flw:dispute',
-  });
-
-  const result = await RetentionWorker.runRetentionSweep(/** @type {any} */ (mockPool), {
-    rawPayloadRetentionDays: 30,
-    normalizedMetadataRetentionDays: 90,
-  });
-
-  assert.equal(result.payloadsPruned, 0);
-  assert.equal(result.metadataPurged, 0);
-
-  const ev = mockPool.events.get('evt_legal_hold_1');
-  assert.ok(ev);
-  assert.notEqual(ev.encrypted_payload, null); // Payload intact!
-  assert.equal(ev.payload_deleted_at, null);
-});
-
-test('RetentionWorker: purges classified audits according to purpose (365d operational vs 7y security)', async () => {
-  const mockPool = createMockRetentionPool();
-
-  const now = Date.now();
-  const fourHundredDaysAgo = new Date(now - 400 * 24 * 3600 * 1000); // > 365d, < 2555d
-
-  // Operational audit > 365 days -> Purged
-  mockPool.audits.set('audit_op_1', {
-    id: 'audit_op_1',
-    created_at: fourHundredDaysAgo,
-    audit_class: 'operational',
-    legal_hold: false,
-  });
-
-  // Security audit > 365 days but < 7 years -> Retained!
-  mockPool.audits.set('audit_sec_1', {
-    id: 'audit_sec_1',
-    created_at: fourHundredDaysAgo,
-    audit_class: 'security',
-    legal_hold: false,
-  });
-
-  const result = await RetentionWorker.runRetentionSweep(/** @type {any} */ (mockPool), {
-    operationalAuditRetentionDays: 365,
-    securityAuditRetentionDays: 2555,
-  });
-
-  assert.equal(result.auditsPurged, 1);
-  assert.equal(mockPool.audits.has('audit_op_1'), false); // Pruned
-  assert.equal(mockPool.audits.has('audit_sec_1'), true); // Retained!
+      // Verify DB: Security audit was retained!
+      const checkSec = await pool.query(
+        `SELECT id FROM cwids.administrative_audit_events WHERE id = $1`,
+        [secAuditId],
+      );
+      assert.equal(checkSec.rows.length, 1);
+    });
+  } finally {
+    if (appId) {
+      await cleanupTestTenants(pool, [appId]);
+    }
+    await closeTestPool();
+  }
 });

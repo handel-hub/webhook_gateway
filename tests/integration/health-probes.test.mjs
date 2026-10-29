@@ -4,6 +4,7 @@ import express from 'express';
 import http from 'node:http';
 import { createHealthRouter } from '../../src/ingress/health.mjs';
 import { metrics, startMetricsServer } from '../../src/observability/metrics.mjs';
+import { getTestPool, closeTestPool } from '../helpers/db-test-helper.mjs';
 
 test('Health probes: GET /live returns 200 with uptime and status = ok', async () => {
   const router = createHealthRouter({ pool: /** @type {any} */ ({}) });
@@ -26,22 +27,8 @@ test('Health probes: GET /live returns 200 with uptime and status = ok', async (
 });
 
 test('Health probes: GET /ready returns 200 when database connection is healthy', async () => {
-  const mockPool = {
-    async connect() {
-      return {
-        /**
-         * @param {string} sql
-         */
-        async query(sql) {
-          assert.equal(sql, 'SELECT 1');
-          return { rows: [{ '?column?': 1 }] };
-        },
-        release() {},
-      };
-    },
-  };
-
-  const router = createHealthRouter({ pool: /** @type {any} */ (mockPool) });
+  const pool = getTestPool();
+  const router = createHealthRouter({ pool });
   const app = express();
   app.use(router);
   const server = http.createServer(app);
@@ -108,5 +95,6 @@ test('Metrics: Prometheus /metrics exposes standard metrics format', async () =>
     assert.ok(text.includes('cwids_delivery_attempts_total 0'));
   } finally {
     await metricsHandle.close();
+    await closeTestPool();
   }
 });

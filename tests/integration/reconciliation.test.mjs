@@ -1,218 +1,190 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { ReconciliationWorker } from '../../src/maintenance/reconciliation-worker.mjs';
-import { FlutterwaveReconciliationAdapter } from '../../src/providers/flutterwave/reconciliation.mjs';
 import { PaystackReconciliationAdapter } from '../../src/providers/paystack/reconciliation.mjs';
+import {
+  getTestPool,
+  closeTestPool,
+  createTestApp,
+  createTestProviderConnection,
+  cleanupTestTenants,
+} from '../helpers/db-test-helper.mjs';
 
-function createMockReconciliationPool() {
-  /** @type {any[]} */
-  const candidates = [];
-  /** @type {any[]} */
-  const savedRecords = [];
+test('ReconciliationWorker: Real PostgreSQL Integration Suite', async (t) => {
+  const pool = getTestPool();
+  let appId = '';
 
-  const client = {
-    /**
-     * @param {string} sql
-     * @param {any[]} [params]
-     */
-    async query(sql, params = []) {
-      const s = sql.trim().toUpperCase();
+  try {
+    const app = await createTestApp(pool, { name: 'Reconciliation App' });
+    appId = app.id;
+    const conn = await createTestProviderConnection(pool, {
+      applicationId: appId,
+      provider: 'paystack',
+      environment: 'live',
+    });
 
-      if (s.startsWith('BEGIN') || s.startsWith('COMMIT') || s.startsWith('ROLLBACK')) {
-        return { rows: [] };
-      }
+    await t.test('skips execution when RECONCILIATION_ENABLED is false', async () => {
+      /** @type {any} */
+      const mockEnv = {
+        RECONCILIATION_ENABLED: false,
+      };
 
-      if (s.includes('SET_CONFIG')) {
-        return { rows: [] };
-      }
+      const result = await ReconciliationWorker.runReconciliationCycle(pool, mockEnv);
 
-      // ReconciliationRepo.findCandidates
-      if (s.includes('FROM CWIDS.PAYMENT_INTENT_CORRELATIONS PIC') && s.includes('LEFT JOIN CWIDS.RECONCILIATION_RECORDS')) {
-        return { rows: [...candidates] };
-      }
+      assert.equal(result.processed, 0);
+      assert.equal(result.matched, 0);
+      assert.equal(result.discrepancies, 0);
+    });
 
-      // ReconciliationRepo.insertRecord
-      if (s.includes('INSERT INTO CWIDS.RECONCILIATION_RECORDS')) {
-        const record = {
-          id: params[0] ?? 'rec_1',
-          payment_intent_id: params[1],
-          provider_connection_id: params[2],
-          status: params[3],
-          provider_status: params[4],
-          verified_amount_minor: params[5],
-          verified_currency: params[6],
-          verified_reference: params[7],
-          raw_response: JSON.parse(params[8]),
-          discrepancy_notes: params[9],
-        };
-        savedRecords.push(record);
-        return { rows: [record] };
-      }
+    await t.test('processes matching transaction and records status = matched in database', async () => {
+      const merchantRef = `ORD-REC-MATCH-${crypto.randomBytes(4).toString('hex')}`;
 
-      throw new Error(`Unhandled SQL: ${sql}`);
-    },
-    release() {},
-  };
-
-  return {
-    candidates,
-    savedRecords,
-    async connect() {
-      return client;
-    },
-  };
-}
-
-test('ReconciliationWorker: skips execution when RECONCILIATION_ENABLED is false', async () => {
-  const mockPool = createMockReconciliationPool();
-  /** @type {any} */
-  const mockEnv = {
-    RECONCILIATION_ENABLED: false,
-  };
-
-  const result = await ReconciliationWorker.runReconciliationCycle(
-    /** @type {any} */ (mockPool),
-    mockEnv,
-  );
-
-  assert.equal(result.processed, 0);
-  assert.equal(mockPool.savedRecords.length, 0);
-});
-
-test('ReconciliationWorker: processes matching transaction and records status = matched', async () => {
-  // Spin up mock provider HTTP verification server
-  const server = http.createServer((req, res) => {
-    if (req.url?.includes('verify')) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          status: true,
-          message: 'Verification successful',
-          data: {
-            id: 991122,
-            reference: 'ORDER-MATCH-01',
-            amount: 500000, // 500000 kobo (matches 500000 minor)
-            currency: 'NGN',
-            status: 'success',
-          },
-        }),
+      // 1. Seed active intent created 45 minutes ago
+      const intentRes = await pool.query(
+        `INSERT INTO cwids.payment_intent_correlations
+           (application_id, provider_connection_id, environment, merchant_reference, expected_amount_minor, currency, idempotency_key, expires_at, status, created_at)
+         VALUES ($1, $2, $3, $4, 500000, 'NGN', $5, CURRENT_TIMESTAMP + interval '1 day', 'active', CURRENT_TIMESTAMP - interval '45 minutes')
+         RETURNING id`,
+        [appId, conn.id, conn.environment, merchantRef, `idem-${merchantRef}`],
       );
-    } else {
-      res.writeHead(404);
-      res.end();
+      const intentId = intentRes.rows[0].id;
+
+      // 2. Spin up ephemeral mock provider HTTP verification server
+      const server = http.createServer((req, res) => {
+        if (req.url?.includes('verify')) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              status: true,
+              message: 'Verification successful',
+              data: {
+                id: 991122,
+                reference: merchantRef,
+                amount: 500000, // 500000 kobo (matches 500000 minor)
+                currency: 'NGN',
+                status: 'success',
+              },
+            }),
+          );
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+
+      await new Promise((resolve) => server.listen({ port: 0, host: '127.0.0.1' }, () => resolve(undefined)));
+      const addr = /** @type {import('node:net').AddressInfo} */ (server.address());
+      const providerUrl = `http://127.0.0.1:${addr.port}`;
+
+      const origVerify = PaystackReconciliationAdapter.verifyTransaction;
+      PaystackReconciliationAdapter.verifyTransaction = (args) =>
+        origVerify({ ...args, baseUrl: providerUrl });
+
+      try {
+        /** @type {any} */
+        const mockEnv = {
+          RECONCILIATION_ENABLED: true,
+          PAYSTACK_RECONCILIATION_SECRET_KEY: 'sk_test_paystack_secret',
+          RECONCILIATION_TIMEOUT_MS: 3000,
+        };
+
+        const result = await ReconciliationWorker.runReconciliationCycle(
+          pool,
+          mockEnv,
+          { minAgeMinutes: 30, rateLimitDelayMs: 0 },
+        );
+
+        assert.ok(result.processed >= 1, 'Should process at least 1 candidate');
+        assert.ok(result.matched >= 1, 'Should match transaction');
+
+        // Verify row in real cwids.reconciliation_records table
+        const recCheck = await pool.query(
+          `SELECT status, verified_amount_minor, discrepancy_notes FROM cwids.reconciliation_records WHERE payment_intent_id = $1`,
+          [intentId],
+        );
+        assert.equal(recCheck.rows.length, 1);
+        assert.equal(recCheck.rows[0].status, 'matched');
+        assert.equal(Number(recCheck.rows[0].verified_amount_minor), 500000);
+        assert.equal(recCheck.rows[0].discrepancy_notes, null);
+      } finally {
+        PaystackReconciliationAdapter.verifyTransaction = origVerify;
+        await new Promise((resolve) => server.close(() => resolve(undefined)));
+      }
+    });
+
+    await t.test('detects amount mismatch and records discrepancy_detected with notes in database', async () => {
+      const merchantRef = `ORD-REC-DISC-${crypto.randomBytes(4).toString('hex')}`;
+
+      // 1. Seed active intent with expected 500,000 minor
+      const intentRes = await pool.query(
+        `INSERT INTO cwids.payment_intent_correlations
+           (application_id, provider_connection_id, environment, merchant_reference, expected_amount_minor, currency, idempotency_key, expires_at, status, created_at)
+         VALUES ($1, $2, $3, $4, 500000, 'NGN', $5, CURRENT_TIMESTAMP + interval '1 day', 'active', CURRENT_TIMESTAMP - interval '45 minutes')
+         RETURNING id`,
+        [appId, conn.id, conn.environment, merchantRef, `idem-${merchantRef}`],
+      );
+      const intentId = intentRes.rows[0].id;
+
+      // 2. Mock provider returns conflicting amount (250,000 instead of 500,000)
+      const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            status: true,
+            data: {
+              reference: merchantRef,
+              amount: 250000,
+              currency: 'NGN',
+              status: 'success',
+            },
+          }),
+        );
+      });
+
+      await new Promise((resolve) => server.listen({ port: 0, host: '127.0.0.1' }, () => resolve(undefined)));
+      const addr = /** @type {import('node:net').AddressInfo} */ (server.address());
+      const providerUrl = `http://127.0.0.1:${addr.port}`;
+
+      const origVerify = PaystackReconciliationAdapter.verifyTransaction;
+      PaystackReconciliationAdapter.verifyTransaction = (args) =>
+        origVerify({ ...args, baseUrl: providerUrl });
+
+      try {
+        /** @type {any} */
+        const mockEnv = {
+          RECONCILIATION_ENABLED: true,
+          PAYSTACK_RECONCILIATION_SECRET_KEY: 'sk_test_paystack_secret',
+          RECONCILIATION_TIMEOUT_MS: 3000,
+        };
+
+        const result = await ReconciliationWorker.runReconciliationCycle(
+          pool,
+          mockEnv,
+          { minAgeMinutes: 30, rateLimitDelayMs: 0 },
+        );
+
+        assert.ok(result.processed >= 1);
+        assert.ok(result.discrepancies >= 1);
+
+        // Verify discrepancy row in real cwids.reconciliation_records table
+        const recCheck = await pool.query(
+          `SELECT status, verified_amount_minor, discrepancy_notes FROM cwids.reconciliation_records WHERE payment_intent_id = $1`,
+          [intentId],
+        );
+        assert.equal(recCheck.rows.length, 1);
+        assert.equal(recCheck.rows[0].status, 'discrepancy_detected');
+        assert.ok(recCheck.rows[0].discrepancy_notes.includes('Amount mismatch'));
+      } finally {
+        PaystackReconciliationAdapter.verifyTransaction = origVerify;
+        await new Promise((resolve) => server.close(() => resolve(undefined)));
+      }
+    });
+  } finally {
+    if (appId) {
+      await cleanupTestTenants(pool, [appId]);
     }
-  });
-
-  await new Promise((resolve) => server.listen({ port: 0, host: '127.0.0.1' }, () => resolve(undefined)));
-  const addr = /** @type {import('node:net').AddressInfo} */ (server.address());
-  const providerUrl = `http://127.0.0.1:${addr.port}`;
-
-  const mockPool = createMockReconciliationPool();
-  mockPool.candidates.push({
-    intentId: 'intent_match_1',
-    merchantReference: 'ORDER-MATCH-01',
-    providerConnectionId: 'conn_pstk_1',
-    provider: 'paystack',
-    environment: 'live',
-    expectedAmountMinor: 500000,
-    expectedCurrency: 'NGN',
-  });
-
-  // Temporarily override adapter baseUrl for test
-  const origVerify = PaystackReconciliationAdapter.verifyTransaction;
-  PaystackReconciliationAdapter.verifyTransaction = (args) =>
-    origVerify({ ...args, baseUrl: providerUrl });
-
-  try {
-    /** @type {any} */
-    const mockEnv = {
-      RECONCILIATION_ENABLED: true,
-      PAYSTACK_RECONCILIATION_SECRET_KEY: 'sk_test_paystack_secret',
-      RECONCILIATION_TIMEOUT_MS: 3000,
-    };
-
-    const result = await ReconciliationWorker.runReconciliationCycle(
-      /** @type {any} */ (mockPool),
-      mockEnv,
-      { rateLimitDelayMs: 0 },
-    );
-
-    assert.equal(result.processed, 1);
-    assert.equal(result.matched, 1);
-    assert.equal(result.discrepancies, 0);
-
-    const saved = mockPool.savedRecords[0];
-    assert.ok(saved);
-    assert.equal(saved.status, 'matched');
-    assert.equal(saved.verified_amount_minor, 500000);
-    assert.equal(saved.discrepancy_notes, null);
-  } finally {
-    PaystackReconciliationAdapter.verifyTransaction = origVerify;
-    await new Promise((resolve) => server.close(() => resolve(undefined)));
-  }
-});
-
-test('ReconciliationWorker: detects amount mismatch and records discrepancy_detected with notes', async () => {
-  // Mock provider returning different charged amount
-  const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        status: true,
-        data: {
-          reference: 'ORDER-DISC-01',
-          amount: 250000, // Charged 250000 kobo instead of expected 500000!
-          currency: 'NGN',
-          status: 'success',
-        },
-      }),
-    );
-  });
-
-  await new Promise((resolve) => server.listen({ port: 0, host: '127.0.0.1' }, () => resolve(undefined)));
-  const addr = /** @type {import('node:net').AddressInfo} */ (server.address());
-  const providerUrl = `http://127.0.0.1:${addr.port}`;
-
-  const mockPool = createMockReconciliationPool();
-  mockPool.candidates.push({
-    intentId: 'intent_disc_1',
-    merchantReference: 'ORDER-DISC-01',
-    providerConnectionId: 'conn_pstk_1',
-    provider: 'paystack',
-    environment: 'live',
-    expectedAmountMinor: 500000, // Expected 500,000 minor
-    expectedCurrency: 'NGN',
-  });
-
-  const origVerify = PaystackReconciliationAdapter.verifyTransaction;
-  PaystackReconciliationAdapter.verifyTransaction = (args) =>
-    origVerify({ ...args, baseUrl: providerUrl });
-
-  try {
-    /** @type {any} */
-    const mockEnv = {
-      RECONCILIATION_ENABLED: true,
-      PAYSTACK_RECONCILIATION_SECRET_KEY: 'sk_test_paystack_secret',
-      RECONCILIATION_TIMEOUT_MS: 3000,
-    };
-
-    const result = await ReconciliationWorker.runReconciliationCycle(
-      /** @type {any} */ (mockPool),
-      mockEnv,
-      { rateLimitDelayMs: 0 },
-    );
-
-    assert.equal(result.processed, 1);
-    assert.equal(result.matched, 0);
-    assert.equal(result.discrepancies, 1);
-
-    const saved = mockPool.savedRecords[0];
-    assert.ok(saved);
-    assert.equal(saved.status, 'discrepancy_detected');
-    assert.ok(saved.discrepancy_notes.includes('Amount mismatch'));
-  } finally {
-    PaystackReconciliationAdapter.verifyTransaction = origVerify;
-    await new Promise((resolve) => server.close(() => resolve(undefined)));
+    await closeTestPool();
   }
 });

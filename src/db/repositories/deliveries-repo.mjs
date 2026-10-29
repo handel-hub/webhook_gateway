@@ -109,18 +109,11 @@ export const DeliveriesRepo = {
    */
   async claimBatch(client, batchSize, leaseSeconds, workerIdentity) {
     const res = await client.query(
-      `WITH ranked_claimable AS (
+      `WITH claimable AS (
          SELECT ed.id,
                 ed.destination_endpoint_id,
                 cb.state as cb_state,
-                ROW_NUMBER() OVER (
-                  PARTITION BY ed.application_id 
-                  ORDER BY ed.next_attempt_at ASC
-                ) as tenant_rank,
-                ROW_NUMBER() OVER (
-                  PARTITION BY ed.destination_endpoint_id
-                  ORDER BY ed.next_attempt_at ASC
-                ) as endpoint_rank
+                de.http_timeout_ms
          FROM cwids.event_deliveries ed
          JOIN cwids.destination_endpoints de ON ed.destination_endpoint_id = de.id
          LEFT JOIN cwids.circuit_breaker_states cb ON ed.destination_endpoint_id = cb.destination_endpoint_id
@@ -131,26 +124,20 @@ export const DeliveriesRepo = {
              OR cb.state = 'closed'
              OR (cb.state = 'half_open' AND cb.half_open_probe_in_flight = FALSE)
            )
-       ),
-       selected_batch AS (
-         SELECT id, destination_endpoint_id, cb_state
-         FROM ranked_claimable
-         WHERE tenant_rank <= 10
-           AND (cb_state IS DISTINCT FROM 'half_open' OR endpoint_rank = 1)
-         ORDER BY tenant_rank ASC
+         ORDER BY ed.next_attempt_at ASC
          LIMIT $1
-         FOR UPDATE SKIP LOCKED
+         FOR UPDATE OF ed SKIP LOCKED
        ),
        updated_deliveries AS (
          UPDATE cwids.event_deliveries target
          SET status = 'in_flight',
-             lease_expires_at = CURRENT_TIMESTAMP + ((GREATEST(COALESCE($2, 30), CEIL(COALESCE(de.http_timeout_ms, 10000)::numeric / 1000.0) + 30) || ' seconds')::interval),
+             lease_expires_at = CURRENT_TIMESTAMP + ((GREATEST(COALESCE($2, 30), CEIL(COALESCE(c.http_timeout_ms, 10000)::numeric / 1000.0) + 30) || ' seconds')::interval),
              fencing_token = target.fencing_token + 1,
              claimed_by_worker = $3,
              updated_at = CURRENT_TIMESTAMP
-         FROM selected_batch sb
-         JOIN cwids.destination_endpoints de ON sb.destination_endpoint_id = de.id
-         WHERE target.id = sb.id
+         FROM claimable c
+         WHERE target.id = c.id
+           AND target.status IN ('pending', 'retry_scheduled')
          RETURNING
            target.id as "deliveryId",
            target.event_id as "eventId",
@@ -169,9 +156,9 @@ export const DeliveriesRepo = {
          UPDATE cwids.circuit_breaker_states cb
          SET half_open_probe_in_flight = true,
              updated_at = CURRENT_TIMESTAMP
-         FROM selected_batch sb
-         WHERE cb.destination_endpoint_id = sb.destination_endpoint_id
-           AND sb.cb_state = 'half_open'
+         FROM claimable c
+         WHERE cb.destination_endpoint_id = c.destination_endpoint_id
+           AND c.cb_state = 'half_open'
        )
        SELECT * FROM updated_deliveries;`,
       [batchSize, leaseSeconds, workerIdentity],

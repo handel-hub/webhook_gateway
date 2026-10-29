@@ -356,8 +356,9 @@ export function createInternalApiRouter({ pool }) {
              AND environment = $2
              AND routing_status = 'awaiting_route'
              AND (
-               ($3 = 'provider_reference' AND provider_reference = $4)
-               OR ($3 = 'virtual_account_id' AND virtual_account_id = $4)
+               ($3 = 'provider_reference' AND (provider_event_id = $4 OR resource_reference = $4))
+               OR ($3 = 'virtual_account_id' AND resource_reference = $4)
+               OR (resource_reference = $4)
              )
            FOR UPDATE SKIP LOCKED`,
           [intent.provider_connection_id, intent.environment, alias_type, alias_value],

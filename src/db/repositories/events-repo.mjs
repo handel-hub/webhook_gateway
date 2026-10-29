@@ -85,6 +85,7 @@ export const EventsRepo = {
    */
   async insertEvent(client, data) {
     try {
+      await client.query('SAVEPOINT sp_insert_event');
       const res = await client.query(
         `INSERT INTO cwids.webhook_events
            (id, provider_connection_id, provider, environment, identity_strategy_version, dedupe_key,
@@ -121,6 +122,7 @@ export const EventsRepo = {
           data.payloadSha256,
         ],
       );
+      await client.query('RELEASE SAVEPOINT sp_insert_event');
       /** @type {WebhookEventRecord[]} */
       const rows = res.rows;
       const row = rows[0];
@@ -131,6 +133,9 @@ export const EventsRepo = {
     } catch (err) {
       // @ts-ignore - pg error code check
       if (err && err.code === '23505') {
+        try {
+          await client.query('ROLLBACK TO SAVEPOINT sp_insert_event');
+        } catch (_) {}
         const existing = await this.findByDedupe(
           client,
           data.providerConnectionId,
