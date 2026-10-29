@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import pg from 'pg';
 import { ApplicationsRepo } from '../db/repositories/applications-repo.mjs';
 import { IntentsRepo } from '../db/repositories/intents-repo.mjs';
+import { DeliveriesRepo } from '../db/repositories/deliveries-repo.mjs';
 import { withTransaction } from '../db/transaction.mjs';
 
 /**
@@ -173,9 +174,25 @@ export function createInternalApiRouter({ pool }) {
       const app = /** @type {AuthenticatedRequest} */ (/** @type {unknown} */ (req)).appTenant;
       const appId = app.id;
 
-      // 6. Check existing intent by idempotency key
+      // 6. Check existing intent by idempotency key & enforce anti-squatting
       const client = await pool.connect();
       try {
+        const connRes = await client.query(
+          'SELECT id, application_id FROM cwids.provider_connections WHERE id = $1',
+          [provider_connection_id],
+        );
+        const conn = connRes.rows[0];
+        if (conn && conn.application_id === null) {
+          const requiredPrefix = `${app.code}_`;
+          if (!merchant_reference.startsWith(requiredPrefix)) {
+            res.status(422).json({
+              code: 'INVALID_MERCHANT_REFERENCE',
+              message: `merchant_reference on shared connections must be prefixed with '${requiredPrefix}'.`,
+            });
+            return;
+          }
+        }
+
         const existing = await IntentsRepo.findByIdempotencyKey(client, appId, idempotencyKey);
         if (existing) {
           const isMatching =
@@ -300,20 +317,22 @@ export function createInternalApiRouter({ pool }) {
       }
 
       const app = /** @type {AuthenticatedRequest} */ (/** @type {unknown} */ (req)).appTenant;
-      const client = await pool.connect();
-      try {
-        const intent = await IntentsRepo.findById(client, intentId);
+      const appId = app.id;
+
+      let resolvedCount = 0;
+      await withTransaction(pool, appId, async (txClient) => {
+        const intent = await IntentsRepo.findById(txClient, intentId);
         if (!intent) {
           res.status(404).json({ code: 'NOT_FOUND', message: 'Payment intent not found.' });
           return;
         }
 
-        if (intent.application_id !== app.id) {
+        if (intent.application_id !== appId) {
           res.status(403).json({ code: 'FORBIDDEN', message: 'Payment intent belongs to another tenant.' });
           return;
         }
 
-        await IntentsRepo.createAlias(client, {
+        await IntentsRepo.createAlias(txClient, {
           paymentIntentId: intent.id,
           providerConnectionId: intent.provider_connection_id,
           environment: intent.environment,
@@ -321,12 +340,58 @@ export function createInternalApiRouter({ pool }) {
           aliasValue: alias_value,
         });
 
+        // Query active destination endpoint for this application
+        const epRes = await txClient.query(
+          `SELECT id FROM cwids.destination_endpoints 
+           WHERE application_id = $1 AND status = 'active' 
+           ORDER BY version DESC LIMIT 1`,
+          [appId],
+        );
+        const endpoint = epRes.rows[0];
+
+        // Atomically re-evaluate matching awaiting_route events (B3 Fix)
+        const matchRes = await txClient.query(
+          `SELECT id FROM cwids.webhook_events
+           WHERE provider_connection_id = $1
+             AND environment = $2
+             AND routing_status = 'awaiting_route'
+             AND (
+               ($3 = 'provider_reference' AND provider_reference = $4)
+               OR ($3 = 'virtual_account_id' AND virtual_account_id = $4)
+             )
+           FOR UPDATE SKIP LOCKED`,
+          [intent.provider_connection_id, intent.environment, alias_type, alias_value],
+        );
+
+        for (const ev of matchRes.rows) {
+          await txClient.query(
+            `UPDATE cwids.webhook_events
+             SET routing_status = 'resolved',
+                 application_id = $1,
+                 payment_intent_id = $2,
+                 routing_mode = 'MODE_C_DYNAMIC_ALIAS'
+             WHERE id = $3`,
+            [appId, intent.id, ev.id],
+          );
+
+          if (endpoint) {
+            await DeliveriesRepo.insertDelivery(txClient, {
+              eventId: ev.id,
+              applicationId: appId,
+              destinationEndpointId: endpoint.id,
+            });
+          }
+        }
+
+        resolvedCount = matchRes.rows.length;
+      });
+
+      if (!res.headersSent) {
         res.status(201).json({
           status: 'success',
           message: 'Alias registered successfully.',
+          resolved_events_count: resolvedCount,
         });
-      } finally {
-        client.release();
       }
     } catch (err) {
       next(err);

@@ -30,12 +30,13 @@ export async function resolveRouting(client, { providerConnection, routingKeys }
   // Mode A: Merchant Reference Match (Payment Intent Correlation)
   if (routingKeys.merchantReference) {
     const res = await client.query(
-      `SELECT id, application_id
+      `SELECT DISTINCT id, application_id
        FROM cwids.payment_intent_correlations
        WHERE provider_connection_id = $1
          AND environment = $2
          AND merchant_reference = $3
-         AND status = 'active'`,
+         AND status IN ('active', 'consumed')
+         AND (expires_at IS NULL OR expires_at + INTERVAL '7 days' >= CURRENT_TIMESTAMP)`,
       [providerConnection.id, providerConnection.environment, routingKeys.merchantReference],
     );
 
@@ -62,14 +63,15 @@ export async function resolveRouting(client, { providerConnection, routingKeys }
   // Mode C: Dynamic Provider Alias Match (Virtual Account / Dynamic Provider Reference)
   if (routingKeys.providerReference || routingKeys.virtualAccountId) {
     const aliasRes = await client.query(
-      `SELECT pic.id, pic.application_id
+      `SELECT DISTINCT pic.id, pic.application_id
        FROM cwids.payment_intent_aliases pia
        JOIN cwids.payment_intent_correlations pic ON pia.payment_intent_id = pic.id
        WHERE pia.provider_connection_id = $1
          AND pia.environment = $2
          AND ((pia.alias_type = 'provider_reference' AND pia.alias_value = $3)
            OR (pia.alias_type = 'virtual_account_id' AND pia.alias_value = $4))
-         AND pic.status = 'active'`,
+         AND pic.status IN ('active', 'consumed')
+         AND (pic.expires_at IS NULL OR pic.expires_at + INTERVAL '7 days' >= CURRENT_TIMESTAMP)`,
       [
         providerConnection.id,
         providerConnection.environment,

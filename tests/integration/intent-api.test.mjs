@@ -119,6 +119,21 @@ function createMockPool() {
         return { rows: [newRecord] };
       }
 
+      // Provider connection lookup
+      if (s.includes('FROM CWIDS.PROVIDER_CONNECTIONS')) {
+        return { rows: [{ id: params[0], application_id: 'app_test_111' }] };
+      }
+
+      // Endpoint lookup
+      if (s.includes('FROM CWIDS.DESTINATION_ENDPOINTS')) {
+        return { rows: [] };
+      }
+
+      // Webhook events lookup
+      if (s.includes('FROM CWIDS.WEBHOOK_EVENTS')) {
+        return { rows: [] };
+      }
+
       // Insert alias
       if (s.includes('INSERT INTO CWIDS.PAYMENT_INTENT_ALIASES')) {
         const hasAppId = params.length === 6;
