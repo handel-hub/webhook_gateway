@@ -1856,3 +1856,42 @@ Do not freeze Phase 1 until these are complete:
 11. Define deployment profile, RPO/RTO, backup/restore drill, metrics, and load-test acceptance thresholds.
 
 The original sections remain valid where they do not conflict with this section. Where a previous section left a value configurable or deferred, this section provides the initial contract; values identified as capacity-test starting points must be validated against actual traffic before production.
+
+### 23.24 Final Implementation & Remediation Reconciliation (Workstreams W0–W8)
+
+The following definitive implementation contracts have been fully remediated, verified, and committed across Workstreams W0 through W8:
+
+1. **Database Runtime Roles and Complete RLS Coverage (W1):**
+   - Three dedicated least-privilege roles are established: `cwids_ingress`, `cwids_worker`, and `cwids_admin`. None possess `SUPERUSER` or `BYPASSRLS`.
+   - Complete Row-Level Security (`ENABLE` and `FORCE ROW LEVEL SECURITY`) is enforced across all tenant tables: `applications`, `destination_endpoints`, `payment_intent_correlations`, `webhook_events`, `event_deliveries`, and `delivery_attempts`.
+   - `cwids_ingress` can insert unrouted webhooks (`application_id IS NULL`) and query active payment intents across shared connections.
+   - `cwids_worker` performs cross-tenant fair-share batch claims when `app.current_tenant` is unset; and under `app.current_tenant` can only read/mutate data for that tenant.
+
+2. **Redrive Epochs and 72-Hour Retry Horizon (W4):**
+   - The global `attempt_count` on `event_deliveries` and `delivery_attempts` is strictly monotonic and preserved across all attempts and manual redrives.
+   - Redrive operations (`POST /v1/admin/deliveries/:id/redrive`) are restricted to `cwids_admin`. They assign a new `epoch_id`, reset `epoch_attempt_count = 0`, reset `horizon_started_at = CURRENT_TIMESTAMP`, and increment `redrive_count` and `fencing_token`.
+   - The 72-hour retry horizon is measured from `horizon_started_at` (the first failure of the current epoch), not event receipt.
+   - Next-attempt delays use database time (`CURRENT_TIMESTAMP + interval`), exponential backoff with full jitter `[0.5*delay, 1.5*delay]`, a 5-second floor, and an emergency ceiling of `max_retries = 50`.
+
+3. **Anti-Squatting Reference Guards & Mode C Distinct (W6):**
+   - On shared provider connections (`provider_connections.application_id IS NULL`), merchant references MUST be prefixed with the tenant's registered code: `${app.code}_<ref>`. Non-prefixed or mismatched references are rejected with HTTP 422 (`INVALID_MERCHANT_REFERENCE`).
+   - Mode A and Mode C queries use `SELECT DISTINCT` with `status IN ('active', 'consumed') AND (expires_at IS NULL OR expires_at + INTERVAL '7 days' >= CURRENT_TIMESTAMP)` to eliminate false quarantines when multiple aliases point to the same intent.
+   - Registering a dynamic alias (`POST /v1/internal/payment-intents/:id/aliases`) atomically searches for existing `awaiting_route` webhooks matching the new alias and routes them immediately to `resolved`, creating their initial delivery obligations.
+
+4. **Dispatcher Safety, Envelope Verification, and Status Classifications (W5):**
+   - Destination 4xx responses: Retried within 72h horizon with operational alerts; HTTP 408 (`Request Timeout`) and HTTP 425 (`Too Early`) are classified as transient retryable. HTTP 501 (`Not Implemented`) dead-letters immediately as `NOT_IMPLEMENTED`.
+   - Destination response verification modes (`destination_endpoints.response_validation_mode`):
+     - `loose`: Any HTTP 2xx is accepted as delivery success.
+     - `strict`: Destination must return HTTP 200 or 202 with a valid JSON acceptance envelope (`{ "received": true }` or `{ "status": "acknowledged" }` or `{ "success": true }`).
+   - Response streams exceeding 2KB (2,048 bytes) are severed immediately via `res.destroy()`, and settled cleanly on `'close'` without memory bloat or hung promises.
+
+5. **Ingress Backpressure & Authentic Malformed Persistence (W7):**
+   - Ingress returns HTTP 503 `Service Unavailable` with `Retry-After: 30` when database connection pool is exhausted or unavailable.
+   - Authentic provider webhooks (valid HMAC signature) containing malformed JSON or unsupported schemas are persisted with AES-256-GCM encrypted payload, `routing_status = 'rejected'`, and return HTTP 200 `{ "status": "acknowledged", "routing_status": "rejected" }` to prevent provider retry floods.
+
+6. **Retention Safety & Dynamic Active Endpoint Resolution (W8):**
+   - Automated payload pruning (30 days) and metadata purging (90 days) strictly exclude `awaiting_route` and `quarantined` events to preserve forensic evidence.
+   - The retention engine scans for and emits operational alerts for unrouted/quarantined events older than 90 days.
+   - Delivery workers resolve the latest active destination endpoint (`ORDER BY version DESC LIMIT 1`) at dispatch time, ensuring URL rotations and key updates take effect immediately for pending retries.
+   - Every delivery attempt records `destination_endpoint_id` and `endpoint_version` in `cwids.delivery_attempts`.
+

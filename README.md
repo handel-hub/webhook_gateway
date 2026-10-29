@@ -57,18 +57,20 @@ The service is implemented as a modular monolith with independently managed gate
 
 ### Technology stack
 
-| Component           | Technology                     |
-| ------------------- | ------------------------------ |
-| Runtime             | Node.js                        |
-| HTTP framework      | Express                        |
-| Database            | PostgreSQL                     |
-| Database client     | `pg`                           |
-| Process supervision | PM2                            |
-| Inbound transport   | HTTPS                          |
-| Outbound delivery   | HTTP over HTTPS                |
-| Durable work queue  | PostgreSQL                     |
-| Database access     | Parameterized SQL              |
-| Logging             | Structured application logging |
+| Component           | Technology                                      |
+| ------------------- | ----------------------------------------------- |
+| Runtime             | Node.js 20+ (Pure Native ESM `.mjs`)           |
+| Static Typing       | TypeScript JSDoc (`checkJs: true`, `noImplicitAny: true`) |
+| HTTP framework      | Express 4.x                                     |
+| Database            | PostgreSQL 15+                                  |
+| Database client     | `pg` (Parameterized SQL only, zero ORM)         |
+| Database Security   | PostgreSQL Row-Level Security (RLS) + Runtime Roles (`cwids_ingress`, `cwids_worker`, `cwids_admin`) |
+| Payload Encryption  | AES-256-GCM Envelope Encryption (per-event DEK + KEK) |
+| Process supervision | PM2                                             |
+| Inbound transport   | HTTPS                                           |
+| Outbound delivery   | HTTP/HTTPS via SSRF-Guarded Agent              |
+| Durable work queue  | PostgreSQL `FOR UPDATE SKIP LOCKED`             |
+| Logging             | Structured JSON logging (Secrets & PII Redacted)|
 
 Redis, Kafka, RabbitMQ, an ORM, and container orchestration are not required for the initial implementation.
 
@@ -115,53 +117,66 @@ Destination applications remain responsible for their business logic. Payment-ow
 
 ## Data model
 
-The initial PostgreSQL schema contains the following logical entities:
+The PostgreSQL schema contains the following core relational entities:
 
 | Entity                        | Responsibility                                                  |
 | ----------------------------- | --------------------------------------------------------------- |
-| `applications`                | Registered destinations and lifecycle state                     |
-| `provider_connections`        | Provider accounts, environments, and verification configuration |
-| `application_provider_routes` | Explicit application-routing rules                              |
-| `webhook_events`              | Immutable records of accepted provider events                   |
-| `event_deliveries`            | Durable delivery state and retry scheduling                     |
-| `delivery_attempts`           | Append-only history of outbound attempts                        |
-| `administrative_audit_events` | Audit trail for privileged operations                           |
+| `applications`                | Registered tenant applications and lifecycle state (`pending`, `active`, `suspended`, `decommissioned`) |
+| `destination_endpoints`       | Versioned delivery endpoints with signing secrets, timeouts, and `response_validation_mode` (`loose` vs `strict`) |
+| `provider_connections`        | Provider accounts, environments (`live`, `test`), and verification secrets |
+| `payment_intent_correlations` | Pre-registered checkout intents for Mode A routing (`active`, `consumed`, `expired`, `cancelled`) |
+| `payment_intent_aliases`      | Dynamic aliases (virtual accounts, provider refs) for Mode C routing |
+| `webhook_events`              | Immutable records of accepted provider events, raw payload ciphertext, DEK/KEK metadata, and `routing_status` (`resolved`, `awaiting_route`, `quarantined`, `rejected`) |
+| `event_deliveries`            | Durable delivery state, monotonic `attempt_count`, fencing tokens, and epoch fields (`epoch_id`, `epoch_attempt_count`, `redrive_count`, `horizon_started_at`) |
+| `delivery_attempts`           | Append-only history recording `destination_endpoint_id`, `endpoint_version`, attempt numbers, fencing tokens, HTTP status, and duration |
+| `circuit_breaker_states`      | Per-destination breaker tracking (`closed`, `half_open`, `open`) with probe concurrency locking |
+| `administrative_audit_events` | Append-only audit trail for privileged operations with legal hold and audit classification (`operational`, `security`, `compliance`) |
+| `audit_outbox`                | Transactional outbox for guaranteed export of administrative audit events to external sinks |
 
-Events and deliveries are separate records. One event may have multiple delivery attempts without creating additional logical events.
+Events and deliveries are strictly decoupled. One event may have multiple delivery attempts across retries and redrives without duplicating logical event records.
 
-The initial routing policy should normally create one delivery per event and authorized application. Fan-out can be supported explicitly where required.
+### Database security & least privilege
+
+All database operations enforce PostgreSQL Row-Level Security (`ENABLE` and `FORCE ROW LEVEL SECURITY`) across all tenant-scoped tables. Zero application or worker code runs as a superuser or database owner.
+
+Three dedicated runtime roles operate under least privilege:
+- **`cwids_ingress`**: Ingestion-only role. Inserts into `webhook_events` (including unrouted events where tenant is null), `event_deliveries`, and `audit_outbox`. Reads active provider connections and payment intent correlations. Denied access to attempt history.
+- **`cwids_worker`**: Delivery execution role. Claims deliveries across tenant queues via fair-share partitioning when unauthenticated; sets `app.current_tenant` to read decrypted event payloads, query active endpoints, and record attempts under strict tenant isolation.
+- **`cwids_admin`**: Administrative role. Authorizes privileged application registration, manual delivery redrives, endpoint versioning, and retention management.
 
 ## Event processing lifecycle
 
 ### Inbound ingestion
 
-1. Receive the provider's HTTP request.
-2. Validate request size, content type, and structure.
-3. Resolve the configured provider connection.
-4. Capture the original request body.
-5. Verify the provider signature using the applicable integration scheme.
-6. Parse and classify the event.
-7. Resolve the intended application using trusted routing information.
-8. Insert the event and initial delivery in one database transaction.
-9. Commit the transaction.
-10. Return the provider's expected successful acknowledgement.
-
-Duplicate notifications must be recognized through a provider-scoped deduplication key enforced by a database uniqueness constraint.
-
-Authentic events that cannot be safely routed should follow an explicit quarantine policy rather than being silently discarded.
+1. Receive the provider's HTTP request on `POST /v1/webhooks/:provider/:connectionId`.
+2. Capture original raw request body Buffer before any JSON parsing.
+3. If database connection pool is exhausted or unavailable, immediately return **HTTP 503 Service Unavailable with `Retry-After: 30`** to signal infrastructure backpressure.
+4. Resolve configured provider connection and verify cryptographic HMAC signature.
+5. If signature is authentic but payload JSON is malformed or unsupported, persist event with AES-256-GCM encrypted payload, set `routing_status = 'rejected'`, and return **HTTP 200 `{ "status": "acknowledged", "routing_status": "rejected" }`** to absorb bad events without triggering provider retry storms.
+6. Extract routing keys (merchant reference, provider reference, virtual account ID).
+7. Execute deterministic routing:
+   - **Mode B (Dedicated):** Connection pre-assigned to a specific tenant application.
+   - **Mode A (Merchant Reference):** Match against active or consumed payment intent within expiry + 7-day grace period. On shared connections, enforce server-controlled namespacing `${app.code}_${reference}` to prevent cross-tenant reference squatting.
+   - **Mode C (Dynamic Alias):** Match against registered dynamic alias using `SELECT DISTINCT` to avoid spurious quarantine when multiple aliases point to the same intent.
+   - **Mode D (Unresolved):** Mark event as `awaiting_route` and quarantine safely. When tenant registers the dynamic alias later, CWIDS automatically re-evaluates `awaiting_route` events and creates delivery obligations.
+8. Persist event record, encryption metadata, and initial delivery in one atomic database transaction.
+9. Commit transaction.
+10. Return HTTP 200 OK provider acknowledgement.
 
 ### Asynchronous delivery
 
-1. A worker claims an eligible delivery using database locking.
-2. The worker assigns a lease token and expiration time.
-3. An attempt record is created.
-4. The worker builds and signs the outbound request.
-5. The request is sent with bounded timeouts.
-6. The response or failure is classified.
-7. The delivery is marked successful, scheduled for retry, or moved to a dead-letter state.
-8. Expired leases are recovered automatically.
-
-Database transactions must not remain open while waiting for destination HTTP responses.
+1. Delivery workers claim eligible deliveries using in-SQL tenant fair-share partitioning (`DENSE_RANK() OVER (PARTITION BY ed.application_id ORDER BY ed.next_attempt_at ASC)`), dynamic lease sizing (`CEIL(http_timeout_ms / 1000) + 30s`), and circuit breaker probe exclusion.
+2. The claim query atomically increments `fencing_token`, sets `status = 'in_flight'`, and assigns `lease_expires_at`.
+3. Worker dynamically resolves the latest active destination endpoint (`ORDER BY version DESC LIMIT 1`) for the tenant application, allowing seamless URL and key rotation for queued retries.
+4. Worker verifies destination IP address using SSRF-Guarded HTTP Client (blocks DNS rebinding, loopback, private RFC-1918, link-local, cloud metadata services).
+5. Worker constructs signed outbound request (`t=...,v1=...` HMAC-SHA256 signature header).
+6. Outbound request is dispatched with bounded timeout. Response stream is bounded: if response body exceeds 2KB, socket is destroyed immediately via `res.destroy()` and settled cleanly without memory bloat.
+7. Destination response is verified:
+   - **`loose` mode:** Any HTTP 2xx is considered acknowledged.
+   - **`strict` mode:** Destination must return HTTP 200/202 with a valid JSON envelope (`{ "received": true }` or `{ "status": "acknowledged" }` or `{ "success": true }`).
+8. Worker writes delivery completion or retry schedule using **strict fenced write**: if `fencing_token` does not match, transaction rolls back immediately with `StaleFencingTokenError` before recording any attempt.
+9. On successful fenced update, attempt history is appended with `destination_endpoint_id` and `endpoint_version`.
+10. Expired worker leases are automatically recovered by background sweeper; jobs exceeding max retries during lease recovery are poisoned-pill dead-lettered with `EXPIRED_LEASE_POISON_PILL`.
 
 ## Delivery states
 
@@ -174,35 +189,35 @@ in_flight
    +----> delivered
    |
    +----> retry_scheduled
-               |
-               v
-           in_flight
-               |
-               v
-           dead_letter
+   |           |
+   |           v
+   |       in_flight
+   |           |
+   v           v
+dead_lettered (terminal)
+   |
+   +-- [Admin Redrive: new epoch] --> pending
 ```
 
-A delivery may also be cancelled where permitted by the administrative policy.
+## Retry policy & 72-hour horizon
 
-Workers must verify their lease token before updating delivery state. Expired or stale workers must not overwrite state established by a newer worker.
+- **72-Hour Maximum Automatic Retry Horizon:** Measured from `horizon_started_at` (the first failure of the current epoch), not event receipt.
+- **Exponential Backoff with Full Jitter:** Base delay 10s, max delay 7,200s (2 hours), jitter interval `[0.5*delay, 1.5*delay]` with a 5s floor. All delays are scheduled using database time (`CURRENT_TIMESTAMP + interval`) to eliminate server clock drift.
+- **Emergency Ceiling:** Hard limit of `max_retries = 50`.
+- **Classification Taxonomy:**
+  - *Transient Network & Server Errors:* Connection errors, timeouts, HTTP 500, 502, 503, 504, 408 (Request Timeout), and 425 (Too Early) are retryable.
+  - *Rate Limiting:* HTTP 429 schedules retry respecting bounded `Retry-After` (5s to 2h).
+  - *Permanent Client Errors:* HTTP 4xx (400, 401, 403, 404, 422) dead-letter immediately as `CLIENT_REJECTED`.
+  - *Not Implemented:* HTTP 501 dead-letters immediately as `NOT_IMPLEMENTED`.
+- **Redrive Epochs:** Operators can redrive `dead_lettered` deliveries via `POST /v1/admin/deliveries/:id/redrive`. Redrive preserves monotonic `attempt_count` history, assigns a new `epoch_id`, resets `epoch_attempt_count = 0`, sets `horizon_started_at = CURRENT_TIMESTAMP`, and increments `redrive_count` and `fencing_token`.
 
-## Retry and recovery
+## Retention and data lifecycle
 
-The service uses configurable exponential backoff with jitter.
-
-Retryable failures may include connection errors, timeouts, HTTP 429 responses, and transient server errors. Permanent failures and configuration errors require separate classification and handling.
-
-The retry policy must define:
-
-- Base delay and maximum delay.
-- Maximum automatic attempts or retry horizon.
-- Request timeout.
-- Lease duration.
-- Lease-recovery interval.
-- Per-application concurrency limits.
-- Dead-letter and alerting behaviour.
-
-Exhausted deliveries remain persisted and inspectable. Authorized operators may replay them through an audited administrative operation.
+- **Encrypted Raw Payloads:** Pruned after 30 days (`ENCRYPTED_PAYLOAD = NULL`, `PAYLOAD_DELETED_AT = CURRENT_TIMESTAMP`) unless flagged with `legal_hold = TRUE`.
+- **Normalized Event Metadata:** Purged after 90 days if deliveries are terminal and `legal_hold = FALSE`.
+- **Forensic Retention Guards:** Unrouted events (`awaiting_route`) and quarantined events (`quarantined`) are strictly excluded from automated payload pruning and metadata purging.
+- **Unrouted Operational Alerting:** Retention worker scans for and alerts on unrouted/quarantined events older than 90 days (`OPERATIONAL_ALERT`).
+- **Administrative Audits:** Retained according to purpose: 365 days for `operational` audits; 7 years (2,555 days) for `security` and `compliance` audits.
 
 ## Provider integrations
 
@@ -245,39 +260,67 @@ Destination registration must not permit arbitrary requests to loopback, private
 
 ## Project structure
 
-The intended module layout is:
+The CWIDS implementation is organized as a modular Node.js native ESM (`.mjs`) architecture:
 
 ```text
 src/
-├── main/
-│   ├── gateway-entry.js
-│   ├── worker-entry.js
-│   └── composition-root.js
-├── config/
-├── http/
-├── providers/
-│   ├── flutterwave/
-│   └── paystack/
-├── applications/
-├── ingestion/
-├── deliveries/
-├── persistence/
-│   └── repositories/
-├── admin/
-├── security/
-├── maintenance/
-├── observability/
-└── shared/
+├── index.mjs                     # Ingress HTTP gateway entry point
+├── worker.mjs                    # Asynchronous delivery worker entry point
+├── config.mjs                    # Environment validation and configuration loader
+├── errors.mjs                    # Typed domain and infrastructure error hierarchy
+├── logger.mjs                    # Structured JSON logger with sensitive data redaction
+├── types/                        # JSDoc type definitions
+│   ├── config.mjs
+│   ├── delivery.mjs
+│   ├── domain.mjs
+│   └── errors.mjs
+├── db/                           # Persistence layer
+│   ├── pool.mjs                  # pg connection pool management
+│   ├── transaction.mjs           # Transaction helper with tenant context
+│   ├── migrator.mjs              # Transactional schema migrator with advisory locking
+│   ├── migrations/               # Forward-only SQL migrations (001-007)
+│   └── repositories/             # Parameterized SQL repositories (events, deliveries, etc.)
+├── ingress/                      # Inbound webhook ingestion
+│   ├── app.mjs                   # Express application and route setup
+│   ├── webhook-handler.mjs       # Webhook ingestion controller with 503 backpressure
+│   └── raw-body.mjs              # Raw-body preservation middleware
+├── providers/                    # Provider adapters
+│   ├── base.mjs                  # Provider adapter abstract interface
+│   ├── flutterwave.mjs           # Flutterwave adapter (HMAC-SHA256 / verif-hash)
+│   ├── paystack.mjs              # Paystack adapter (HMAC-SHA512)
+│   └── registry.mjs              # Provider registry
+├── routing/                      # Deterministic routing engine
+│   └── routing-resolver.mjs      # Modes A, B, C, D deterministic routing
+├── ingestion/                    # Ingestion transaction service
+│   └── ingestion-service.mjs     # Atomic event & delivery creation
+├── delivery/                     # Outbound delivery engine
+│   ├── scheduler.mjs             # Work poller and fair-share claim coordinator
+│   ├── delivery-service.mjs      # Delivery execution with dynamic active endpoint resolution
+│   ├── http-dispatcher.mjs       # HTTP dispatch with 2KB stream safety & envelope verification
+│   ├── retry-policy.mjs          # 72h horizon, exponential backoff, jitter, classifications
+│   ├── circuit-breaker.mjs       # Per-destination circuit breaker with half-open probe lock
+│   └── signer.mjs                # HMAC-SHA256 outbound request signing (t=...,v1=...)
+├── security/                     # Security controls
+│   ├── crypto.mjs                # AES-256-GCM envelope encryption & KEK wrapping
+│   ├── ssrf-agent.mjs            # SSRF-guarded HTTP Agent with DNS pin & IP validation
+│   └── ip-validator.mjs          # Subnet checker (IPv4 & IPv6 private/link-local/metadata)
+├── admin/                        # Administrative and internal API
+│   ├── internal-api.mjs          # Payment intent & dynamic alias registration
+│   └── admin-server.mjs          # Privileged admin routes (redrive, app registration)
+├── maintenance/                  # Background maintenance workers
+│   ├── intent-cleanup-worker.mjs # Expired intent pruning
+│   ├── retention-worker.mjs      # 30d payload pruning, 90d purge, unrouted alerting
+│   └── audit-exporter.mjs        # Audit outbox exporter
+└── observability/                # Telemetry & operational endpoints
+    ├── health.mjs                # /live and /ready probes
+    └── metrics.mjs               # Prometheus metrics server (/metrics)
 
-migrations/
-test/
-├── unit/
-├── integration/
-├── fault-injection/
-└── end-to-end/
+tests/
+├── unit/                         # Unit tests
+├── integration/                  # Integration tests (retention, intent cleanup, etc.)
+│   └── audit-promotions/         # Promoted audit tests (RLS roles, stream truncation, etc.)
+└── fault-injection/              # Concurrency and failure injection tests
 ```
-
-The final filenames may evolve during implementation. The architectural boundaries should remain stable.
 
 ## Getting started
 

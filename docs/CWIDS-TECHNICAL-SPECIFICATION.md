@@ -739,12 +739,13 @@ async function resolveRouting(client, { providerConnection, payload, routingKeys
   // Mode A Check: Merchant Reference Match
   if (routingKeys.merchantReference) {
     const res = await client.query(
-      `SELECT id, application_id 
-       FROM payment_intent_correlations 
+      `SELECT DISTINCT id, application_id 
+       FROM cwids.payment_intent_correlations 
        WHERE provider_connection_id = $1 
          AND environment = $2 
          AND merchant_reference = $3 
-         AND status = 'active'`,
+         AND status IN ('active', 'consumed')
+         AND (expires_at IS NULL OR expires_at + INTERVAL '7 days' >= CURRENT_TIMESTAMP)`,
       [providerConnection.id, providerConnection.environment, routingKeys.merchantReference]
     );
 
@@ -769,14 +770,15 @@ async function resolveRouting(client, { providerConnection, payload, routingKeys
   // Mode C Check: Dynamic Provider Alias Match (Virtual Account / Provider Ref)
   if (routingKeys.providerReference || routingKeys.virtualAccountId) {
     const aliasRes = await client.query(
-      `SELECT pic.id, pic.application_id 
-       FROM payment_intent_aliases pia
-       JOIN payment_intent_correlations pic ON pia.payment_intent_id = pic.id
+      `SELECT DISTINCT pic.id, pic.application_id 
+       FROM cwids.payment_intent_aliases pia
+       JOIN cwids.payment_intent_correlations pic ON pia.payment_intent_id = pic.id
        WHERE pia.provider_connection_id = $1 
          AND pia.environment = $2 
          AND ((pia.alias_type = 'provider_reference' AND pia.alias_value = $3)
            OR (pia.alias_type = 'virtual_account_id' AND pia.alias_value = $4))
-         AND pic.status = 'active'`,
+         AND pic.status IN ('active', 'consumed')
+         AND (pic.expires_at IS NULL OR pic.expires_at + INTERVAL '7 days' >= CURRENT_TIMESTAMP)`,
       [
         providerConnection.id,
         providerConnection.environment,
@@ -791,6 +793,14 @@ async function resolveRouting(client, { providerConnection, payload, routingKeys
         applicationId: aliasRes.rows[0].application_id,
         paymentIntentId: aliasRes.rows[0].id,
         routingMode: 'MODE_C_DYNAMIC_ALIAS'
+      };
+    } else if (aliasRes.rows.length > 1) {
+      // Multiple conflicting payment intents matched -> Quarantine
+      return {
+        status: 'quarantined',
+        applicationId: null,
+        paymentIntentId: null,
+        routingMode: 'CONFLICT_MULTIPLE_MATCHES'
       };
     }
   }
@@ -847,6 +857,7 @@ To satisfy `GAP-01`, CWIDS provides an internal, authenticated API enabling appl
 - `currency`: ISO 4217 three-letter code (`NGN`, `USD`, `GHS`, `KES`).
 - `expires_at`: ISO 8601 UTC timestamp. Minimum duration: 15 minutes; Maximum duration: 30 days from creation.
 - `metadata`: Prohibited from containing credit card numbers (PAN), CVV, or customer credentials.
+- **Anti-Squatting Reference Guards (Shared Connections):** On shared provider connections (`provider_connections.application_id IS NULL`), `merchant_reference` MUST be prefixed with the application's unique code identifier: `${app.code}_<reference>`. Unverified, non-prefixed, or spoofed merchant references from unauthorized tenants are rejected with HTTP 422 (`INVALID_MERCHANT_REFERENCE`).
 
 #### Response Semantics:
 - `201 Created`: Correlation registered successfully.
@@ -859,7 +870,10 @@ When payment providers generate dynamic transaction references during initial AP
 
 `POST /v1/internal/payment-intents/:id/aliases`
 
-This inserts an alias into `payment_intent_aliases` within an atomic transaction, ensuring late-arriving webhooks carrying only the provider's reference can route successfully.
+This operation executes within an atomic database transaction:
+1. Verifies that the payment intent exists and belongs to the authenticated application (`application_id`).
+2. Inserts the alias record into `payment_intent_aliases`.
+3. **Atomic Awaiting-Route Re-Evaluation:** Queries for existing unrouted webhooks (`routing_status = 'awaiting_route'`) matching the newly registered alias. If matching unrouted events exist, CWIDS immediately transitions them to `routing_status = 'resolved'`, links them to the payment intent, snapshots the active destination endpoint, and inserts the initial delivery obligation into `event_deliveries` (`status = 'pending'`). This ensures webhooks that arrived prior to alias registration are never permanently stranded in quarantine.
 
 ### 11.3 Intent Expiry and Cleanup Policy (Resolving GAP-02)
 Expired intents are NOT deleted immediately, as late-arriving bank webhooks may arrive days after customer session abandonment.
@@ -953,9 +967,10 @@ If a network disconnect occurs between PostgreSQL and Node.js during the executi
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Invalid Signature** | Step 5 (Pre-Tx) | None | `401 Unauthorized` | No records written | No delivery generated |
 | **Payload > 1MB** | Step 2 (Pre-Tx) | None | `413 Payload Too Large` | No records written | No delivery generated |
-| **Malformed JSON** | Step 6 (Pre-Tx) | None | `400 Bad Request` | No records written | No delivery generated |
+| **Authentic Signature + Malformed/Unsupported JSON** | Step 6 (Pre-Tx) | Committed | `200 OK` (`{ "status": "acknowledged", "routing_status": "rejected" }`) | Persisted encrypted raw payload (`routing_status = 'rejected'`) | Absorbed safely; No delivery generated; Prevents retry storms |
+| **Unauthentic Malformed Request** | Step 6 (Pre-Tx) | None | `400 Bad Request` | No records written | No delivery generated |
 | **Provider Conn Inactive** | Step 4 (Pre-Tx) | None | `403 Forbidden` | No records written | No delivery generated |
-| **DB Pool Exhaustion** | Step 9 (Pre-Tx) | None | `503 Service Unavailable` | No records written | Provider retries |
+| **DB Pool Exhaustion / Connection Error** | Step 9 (Pre-Tx) | None | `503 Service Unavailable` (`Retry-After: 30`) | No records written | Provider retries with backpressure |
 | **DB Failure During Insert** | Step 12 (In-Tx) | Rolled back | `500 Internal Error` | No records written | Provider retries |
 | **Unrouteable Event** | Step 11 (In-Tx) | Committed | `200 OK` | Event persisted (`awaiting_route`) | Quarantined; No delivery generated |
 | **Normal Duplicate Event** | Step 12 (In-Tx) | Committed | `200 OK` | Duplicate logged | No second delivery generated |
@@ -1013,7 +1028,7 @@ CREATE TABLE applications (
     api_key_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT ck_application_status CHECK (status IN ('active', 'suspended', 'disabled', 'retired'))
+    CONSTRAINT ck_application_status CHECK (status IN ('active', 'suspended', 'disabled', 'retired', 'pending', 'decommissioned'))
 );
 
 CREATE INDEX idx_applications_status ON applications(status);
@@ -1029,12 +1044,14 @@ CREATE TABLE destination_endpoints (
     signing_secret TEXT NOT NULL,
     http_timeout_ms INTEGER NOT NULL DEFAULT 5000,
     max_retries INTEGER NOT NULL DEFAULT 15,
+    response_validation_mode VARCHAR(16) NOT NULL DEFAULT 'loose',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_app_endpoint_version UNIQUE (application_id, version),
     CONSTRAINT ck_endpoint_timeout CHECK (http_timeout_ms BETWEEN 1000 AND 30000),
     CONSTRAINT ck_endpoint_url_https CHECK (url ~* '^https://.*'),
+    CONSTRAINT ck_endpoint_response_validation_mode CHECK (response_validation_mode IN ('loose', 'strict')),
     CONSTRAINT ck_endpoint_status CHECK (status IN ('active', 'deprecated', 'disabled'))
 );
 
@@ -1121,12 +1138,14 @@ CREATE TABLE webhook_events (
     payment_intent_id UUID REFERENCES payment_intent_correlations(id) ON DELETE RESTRICT,
     routing_status TEXT NOT NULL,
     routing_mode TEXT NOT NULL,
-    encrypted_payload BYTEA NOT NULL,
-    payload_nonce BYTEA NOT NULL,
-    payload_tag BYTEA NOT NULL,
-    wrapped_dek BYTEA NOT NULL,
+    encrypted_payload BYTEA,
+    payload_nonce BYTEA,
+    payload_tag BYTEA,
+    wrapped_dek BYTEA,
     kek_version TEXT NOT NULL,
     payload_sha256 CHAR(64) NOT NULL,
+    payload_deleted_at TIMESTAMPTZ,
+    legal_hold BOOLEAN NOT NULL DEFAULT FALSE,
     received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_webhook_events_dedupe UNIQUE (provider_connection_id, environment, identity_strategy_version, dedupe_key),
@@ -1148,6 +1167,10 @@ CREATE TABLE event_deliveries (
     destination_endpoint_id UUID NOT NULL REFERENCES destination_endpoints(id) ON DELETE RESTRICT,
     status TEXT NOT NULL DEFAULT 'pending',
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    epoch_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    epoch_attempt_count INTEGER NOT NULL DEFAULT 0,
+    redrive_count INTEGER NOT NULL DEFAULT 0,
+    horizon_started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     first_attempt_at TIMESTAMPTZ,
     last_attempt_at TIMESTAMPTZ,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1158,6 +1181,7 @@ CREATE TABLE event_deliveries (
     last_error_code TEXT,
     terminal_reason TEXT,
     delivered_at TIMESTAMPTZ,
+    dead_lettered_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_event_delivery UNIQUE (event_id, application_id),
@@ -1183,6 +1207,9 @@ CREATE INDEX idx_event_deliveries_tenant_active
 CREATE TABLE delivery_attempts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     delivery_id UUID NOT NULL REFERENCES event_deliveries(id) ON DELETE CASCADE,
+    application_id UUID REFERENCES applications(id) ON DELETE CASCADE,
+    destination_endpoint_id UUID REFERENCES destination_endpoints(id) ON DELETE SET NULL,
+    endpoint_version INTEGER,
     attempt_number INTEGER NOT NULL,
     fencing_token BIGINT NOT NULL,
     started_at TIMESTAMPTZ NOT NULL,
@@ -1200,6 +1227,7 @@ CREATE TABLE delivery_attempts (
 );
 
 CREATE INDEX idx_delivery_attempts_deliv ON delivery_attempts(delivery_id, attempt_number);
+CREATE INDEX idx_delivery_attempts_endpoint ON delivery_attempts(destination_endpoint_id);
 
 -- ----------------------------------------------------------------------------
 -- 9. CIRCUIT BREAKER STATES
@@ -1228,9 +1256,12 @@ CREATE TABLE administrative_audit_events (
     request_id TEXT NOT NULL,
     outcome TEXT NOT NULL,
     reason_code TEXT,
+    audit_class VARCHAR(16) NOT NULL DEFAULT 'operational',
+    legal_hold BOOLEAN NOT NULL DEFAULT FALSE,
     before_state JSONB,
     after_state JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT ck_audit_class CHECK (audit_class IN ('operational', 'security', 'compliance'))
 );
 
 CREATE TABLE audit_outbox (
@@ -1264,60 +1295,137 @@ ALTER TABLE webhook_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE event_deliveries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE event_deliveries FORCE ROW LEVEL SECURITY;
 
+ALTER TABLE delivery_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE delivery_attempts FORCE ROW LEVEL SECURITY;
+
+-- ----------------------------------------------------------------------------
+-- DEDICATED RUNTIME ROLES (LEAST PRIVILEGE, NON-BYPASS RLS)
+-- ----------------------------------------------------------------------------
+-- Role 1: Ingress Gateway
+CREATE ROLE cwids_ingress WITH LOGIN PASSWORD 'ingress_secret_vault';
+ALTER ROLE cwids_ingress NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+
+-- Role 2: Delivery Worker
+CREATE ROLE cwids_worker WITH LOGIN PASSWORD 'worker_secret_vault';
+ALTER ROLE cwids_worker NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+
+-- Role 3: Administration & Maintenance
+CREATE ROLE cwids_admin WITH LOGIN PASSWORD 'admin_secret_vault';
+ALTER ROLE cwids_admin NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+
 -- ----------------------------------------------------------------------------
 -- RLS POLICIES FOR RUNTIME APPLICATION CONTEXT
 -- ----------------------------------------------------------------------------
+-- Applications: Tenant sees only self; Ingress/Admin can select
 CREATE POLICY tenant_isolation_applications ON applications
     FOR ALL
-    USING (id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+    USING (
+        id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR CURRENT_USER IN ('cwids_admin')
+    );
 
+-- Destination Endpoints:
 CREATE POLICY tenant_isolation_endpoints ON destination_endpoints
     FOR ALL
-    USING (application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+    USING (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR CURRENT_USER IN ('cwids_admin')
+    );
 
+-- Payment Intent Correlations: Ingress reads across shared connections for routing
 CREATE POLICY tenant_isolation_intents ON payment_intent_correlations
     FOR ALL
-    USING (application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+    USING (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR CURRENT_USER IN ('cwids_ingress', 'cwids_admin')
+    );
 
+-- Webhook Events: Ingress can insert unrouted (tenant IS NULL) or routed; Tenant sees own
 CREATE POLICY tenant_isolation_events ON webhook_events
     FOR ALL
-    USING (application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+    USING (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR (CURRENT_USER = 'cwids_ingress' AND (application_id IS NULL OR application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid))
+        OR CURRENT_USER IN ('cwids_admin')
+    )
+    WITH CHECK (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR (CURRENT_USER = 'cwids_ingress')
+        OR CURRENT_USER IN ('cwids_admin')
+    );
 
+-- Event Deliveries: Worker claims cross-tenant batches when app.current_tenant IS NULL; Tenant sees own
 CREATE POLICY tenant_isolation_deliveries ON event_deliveries
     FOR ALL
-    USING (application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+    USING (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR (CURRENT_USER = 'cwids_worker' AND NULLIF(current_setting('app.current_tenant', true), '') IS NULL)
+        OR CURRENT_USER IN ('cwids_admin')
+    )
+    WITH CHECK (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR CURRENT_USER IN ('cwids_ingress', 'cwids_admin')
+        OR (CURRENT_USER = 'cwids_worker' AND NULLIF(current_setting('app.current_tenant', true), '') IS NULL)
+    );
+
+-- Delivery Attempts: Strict tenant isolation during dispatch recording
+CREATE POLICY tenant_isolation_attempts ON delivery_attempts
+    FOR ALL
+    USING (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR CURRENT_USER IN ('cwids_admin')
+    )
+    WITH CHECK (
+        application_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+        OR CURRENT_USER IN ('cwids_admin')
+    );
 ```
 
 ### 15.3 Core Database Worker Queries
 
-#### 1. Worker Batch Claim Query (`FOR UPDATE SKIP LOCKED`)
+#### 1. Worker Batch Claim Query with Tenant Fair-Share & Dynamic Lease Sizing (`FOR UPDATE SKIP LOCKED`)
 ```sql
--- Parameters: $1 = batch_size (e.g. 10), $2 = lease_duration_interval (e.g. '30 seconds'), $3 = worker_id
-WITH claimable AS (
-    SELECT ed.id
-    FROM event_deliveries ed
-    JOIN circuit_breaker_states cb ON ed.destination_endpoint_id = cb.destination_endpoint_id
+-- Parameters: $1 = worker_id, $2 = batch_size (e.g. 10)
+WITH eligible AS (
+    SELECT 
+        ed.id,
+        ed.application_id,
+        ed.destination_endpoint_id,
+        ep.http_timeout_ms,
+        ep.max_retries,
+        DENSE_RANK() OVER (
+            PARTITION BY ed.application_id 
+            ORDER BY ed.next_attempt_at ASC
+        ) as tenant_rank
+    FROM cwids.event_deliveries ed
+    JOIN cwids.destination_endpoints ep ON ed.destination_endpoint_id = ep.id
+    LEFT JOIN cwids.circuit_breaker_states cb ON ed.destination_endpoint_id = cb.destination_endpoint_id
     WHERE ed.status IN ('pending', 'retry_scheduled')
       AND ed.next_attempt_at <= CURRENT_TIMESTAMP
-      AND cb.state != 'open'
-    ORDER BY ed.next_attempt_at ASC
-    LIMIT $1
+      AND (cb.state IS NULL OR cb.state = 'closed' OR (cb.state = 'half_open' AND cb.half_open_probe_in_flight = FALSE))
+    ORDER BY tenant_rank ASC, ed.next_attempt_at ASC
+    LIMIT $2
     FOR UPDATE OF ed SKIP LOCKED
 )
-UPDATE event_deliveries target
+UPDATE cwids.event_deliveries target
 SET status = 'in_flight',
-    lease_expires_at = CURRENT_TIMESTAMP + $2::interval,
+    -- Dynamic lease: Destination HTTP timeout + 30s safety buffer (ADR-11)
+    lease_expires_at = CURRENT_TIMESTAMP + (INTERVAL '1 second' * (CEIL(eligible.http_timeout_ms / 1000.0) + 30)),
     fencing_token = target.fencing_token + 1,
-    claimed_by_worker = $3,
+    claimed_by_worker = $1,
     updated_at = CURRENT_TIMESTAMP
-FROM claimable
-WHERE target.id = claimable.id
+FROM eligible
+WHERE target.id = eligible.id
 RETURNING 
     target.id,
     target.event_id,
     target.application_id,
     target.destination_endpoint_id,
     target.attempt_count,
+    target.epoch_id,
+    target.epoch_attempt_count,
+    target.redrive_count,
+    target.horizon_started_at,
     target.first_attempt_at,
     target.fencing_token,
     target.lease_expires_at;
@@ -1326,7 +1434,7 @@ RETURNING
 #### 2. Worker Fenced Completion Query
 ```sql
 -- Parameters: $1 = delivery_id, $2 = fencing_token, $3 = http_status, $4 = response_status
-UPDATE event_deliveries
+UPDATE cwids.event_deliveries
 SET status = 'delivered',
     delivered_at = CURRENT_TIMESTAMP,
     last_http_status = $3,
@@ -1336,25 +1444,38 @@ SET status = 'delivered',
 WHERE id = $1 
   AND fencing_token = $2 
   AND status = 'in_flight';
--- If rowCount === 0: Throw StaleFencingTokenError
+-- Strict Rollback Invariant: If rowCount === 0: Worker immediately throws StaleFencingTokenError,
+-- rolling back the transaction before recording any delivery attempt.
 ```
 
-#### 3. Expired Lease Recovery Query
+#### 3. Expired Lease Recovery Query with Poison-Pill Detection
 ```sql
 -- Parameters: $1 = batch_size (e.g. 50)
 WITH expired AS (
-    SELECT id
-    FROM event_deliveries
-    WHERE status = 'in_flight'
-      AND lease_expires_at < CURRENT_TIMESTAMP
+    SELECT ed.id, ed.epoch_attempt_count, ep.max_retries
+    FROM cwids.event_deliveries ed
+    JOIN cwids.destination_endpoints ep ON ed.destination_endpoint_id = ep.id
+    WHERE ed.status = 'in_flight'
+      AND ed.lease_expires_at < CURRENT_TIMESTAMP
     LIMIT $1
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF ed SKIP LOCKED
 )
-UPDATE event_deliveries target
-SET status = 'retry_scheduled',
+UPDATE cwids.event_deliveries target
+SET status = CASE 
+        WHEN expired.epoch_attempt_count >= expired.max_retries THEN 'dead_lettered'
+        ELSE 'retry_scheduled' 
+    END,
     lease_expires_at = NULL,
     claimed_by_worker = NULL,
     last_error_code = 'LEASE_EXPIRED_CRASH_RECOVERED',
+    terminal_reason = CASE 
+        WHEN expired.epoch_attempt_count >= expired.max_retries THEN 'EXPIRED_LEASE_POISON_PILL'
+        ELSE NULL 
+    END,
+    dead_lettered_at = CASE 
+        WHEN expired.epoch_attempt_count >= expired.max_retries THEN CURRENT_TIMESTAMP
+        ELSE NULL 
+    END,
     next_attempt_at = CURRENT_TIMESTAMP + INTERVAL '5 seconds',
     updated_at = CURRENT_TIMESTAMP
 FROM expired
@@ -1496,33 +1617,42 @@ To resolve `GAP-05` and `FR-009`, CWIDS enforces a 72-hour payment-critical retr
 
 ### 19.1 Failure Classification Taxonomy
 
-Every network and destination response is classified into one of four operational categories:
+Every network and destination response is classified into an operational category:
 
 | Category | Triggering Condition / HTTP Status | Delivery Action | Circuit Breaker Action |
 | :--- | :--- | :--- | :--- |
 | **Transient Network** | `ECONNRESET`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN` | Schedule Retry with Exponential Backoff | Increments failure count |
-| **Rate Limited** | HTTP 429 (`Too Many Requests`) | Schedule Retry respecting bounded `Retry-After` | Does NOT trip breaker (Traffic issue) |
-| **Transient Server** | HTTP 500, 502, 503, 504 | Schedule Retry with Exponential Backoff | Increments failure count |
+| **Transient Request/Server** | HTTP 408 (`Request Timeout`), 425 (`Too Early`), 500, 502, 503, 504 | Schedule Retry with Exponential Backoff | Increments failure count |
+| **Rate Limited** | HTTP 429 (`Too Many Requests`) | Schedule Retry respecting bounded `Retry-After` (5s to 2h) | Does NOT trip breaker (Traffic issue) |
 | **Ambiguous Transport**| Connection reset during response read after request sent | Schedule Retry (Relies on destination inbox) | Increments failure count |
-| **Configuration Error**| HTTP 401, 403, 404, 405 | Immediate Dead-Letter (Configuration Bug) | Does NOT trip breaker |
-| **Payload Rejection** | HTTP 422 (`Unprocessable Entity`), 400 (`Bad Request`) | Immediate Dead-Letter (Invalid Schema) | Does NOT trip breaker |
+| **Permanent Not Implemented**| HTTP 501 (`Not Implemented`) | Immediate Dead-Letter (`NOT_IMPLEMENTED`) | Does NOT trip breaker |
+| **Client Rejection** | HTTP 400, 401, 403, 404, 422 (`Unprocessable Entity`) | Immediate Dead-Letter (`CLIENT_REJECTED`) | Does NOT trip breaker |
 | **Permanent Security** | `SSRF_BLOCKED_ERROR`, Prohibited IP range | Immediate Dead-Letter (`SECURITY_BLOCKED`) | Does NOT trip breaker |
 | **Transport Success** | HTTP 200, 201, 202, 204 with valid envelope | Mark `delivered` | Resets failure count to 0 |
 
 ### 19.2 The 72-Hour Horizon & Exponential Backoff Calculus
-Payment transactions (e.g. wire transfers, bulk debits) often experience weekend settlement freezes spanning up to 72 hours. Deliveries MUST NOT be abandoned prematurely.
+Payment transactions (e.g. wire transfers, bulk debits) often experience settlement delays spanning up to 72 hours. Deliveries MUST NOT be abandoned prematurely.
 
 #### Mathematical Backoff Formula with Full Jitter:
 $$\text{BaseDelay} = 10 \text{ seconds}$$
 $$\text{MaxDelay} = 7200 \text{ seconds (2 hours)}$$
-$$\text{CalculatedDelay}(n) = \min\left(\text{MaxDelay}, \text{BaseDelay} \times 2^{n-1}\right)$$
-$$\text{ActualDelay}(n) = \text{random\_between}\left(0, \text{CalculatedDelay}(n)\right)$$
+$$\text{CalculatedDelay}(n) = \min\left(\text{MaxDelay}, \text{BaseDelay} \times 2^{n-1}\right) \quad \text{where } n = \text{epoch\_attempt\_count}$$
+$$\text{ActualDelay}(n) = \max\left(5, \text{random\_between}\left(0.5 \times \text{CalculatedDelay}(n), 1.5 \times \text{CalculatedDelay}(n)\right)\right)$$
 
 #### Horizon Boundary Rule:
-Upon calculating $\text{ActualDelay}$, the worker checks the overall elapsed age:
-$$\text{If } (\text{CURRENT\_TIMESTAMP} + \text{ActualDelay}) > (\text{first\_attempt\_at} + 72 \text{ hours}):$$
-$$\text{next\_attempt\_at} = \text{first\_attempt\_at} + 72 \text{ hours}$$
-If `attempt_count` executes at or after the 72-hour mark and fails again, the delivery transitions permanently to `dead_lettered` with `terminal_reason = 'RETRY_HORIZON_EXHAUSTED'`.
+The 72-hour retry horizon is evaluated strictly against `horizon_started_at` (the first failure of the active epoch) using database time:
+$$\text{If } (\text{CURRENT\_TIMESTAMP} + \text{ActualDelay}) > (\text{horizon\_started\_at} + 72 \text{ hours}):$$
+$$\text{next\_attempt\_at} = \text{horizon\_started\_at} + 72 \text{ hours}$$
+If a delivery fails at or after the 72-hour mark, or if `epoch_attempt_count >= max_retries` (emergency ceiling of 50 attempts), the delivery transitions permanently to `dead_lettered` with `terminal_reason = 'RETRY_HORIZON_EXHAUSTED'`.
+
+#### Redrive Epoch Model:
+When an authorized operator redrives a `dead_lettered` delivery via `POST /v1/admin/deliveries/:id/redrive`:
+1. The global `attempt_count` is **strictly preserved monotonically**; attempts are never deleted or rewritten.
+2. A new `epoch_id` (UUIDv4) is assigned.
+3. `epoch_attempt_count` is reset to 0.
+4. `horizon_started_at` is reset to `CURRENT_TIMESTAMP`, granting a fresh 72-hour operational recovery window.
+5. `redrive_count` is incremented by 1.
+6. `fencing_token` is incremented to invalidate any previous stale claims.
 
 ### 19.3 `Retry-After` Header Parsing & Safety Bounds
 If the destination application responds with HTTP 429 and includes a `Retry-After` header:
@@ -1647,66 +1777,42 @@ Destination applications MUST implement the following verification logic:
 
 To resolve `GAP-07` and `PARTIAL-06`, CWIDS establishes an explicit contract for interpreting destination HTTP responses.
 
-### 23.1 Destination Response Envelope Contract
-Compatible destination applications SHOULD respond with HTTP 200/201 and an explicit JSON status envelope:
+### 23.1 Destination Response Verification Modes (`response_validation_mode`)
+Configured per destination endpoint in `destination_endpoints.response_validation_mode`:
 
-```json
-{
-  "delivery_id": "8b6c4b22-83b6-4b2a-89a7-96a84f32c94d",
-  "status": "processed"
-}
-```
+#### 1. `loose` Mode (Default / Standard Microservice Mode):
+Any HTTP 2xx response status (200, 201, 202, 204) is accepted as delivery success. The response body is captured (up to 2KB) for telemetry and audit without requiring a specific JSON envelope structure.
 
-#### Allowed `status` Values:
-1. `processed`: The destination processed this event for the first time and committed its business mutation.
-2. `duplicate_acknowledged`: The destination recognized this event as an idempotent duplicate, performed no duplicate mutation, and acknowledged receipt safely.
-3. `rejected`: The destination intentionally rejected the event (must include `reason` string).
+#### 2. `strict` Mode (High-Assurance Envelope Mode):
+The destination MUST respond with HTTP 200 or 202 and a valid JSON status envelope indicating acceptance:
+- `{ "received": true }`
+- `{ "status": "acknowledged" }` (or `{ "status": "processed" }`, `{ "status": "duplicate_acknowledged" }`)
+- `{ "success": true }`
 
-### 23.2 Legacy / Non-Envelope Compatibility Mode
-If an existing internal endpoint returns HTTP 200 with an empty body or arbitrary JSON:
-- CWIDS accepts HTTP 2xx as transport success.
-- Recorded telemetry marks the attempt as `http_acknowledged_unverified`.
+If a destination in `strict` mode returns HTTP 200 with an empty body, HTML error page, malformed JSON, or a negative status envelope (`{ "status": "rejected" }`), CWIDS classifies the response as `MALFORMED_RESPONSE_ENVELOPE` and schedules a retry within the 72-hour horizon.
 
-### 23.3 Bounded Response Capture & Socket Destruction (Resolving PARTIAL-06)
-Delivery workers MUST NEVER buffer unbounded HTTP responses. Memory is protected via streaming byte count enforcement:
+### 23.2 Bounded Response Capture & Socket Destruction (Resolving PARTIAL-06)
+Delivery workers MUST NEVER buffer unbounded HTTP responses. Memory is protected via streaming byte count enforcement and immediate clean settlement:
 
 ```javascript
-// src/delivery/http-dispatcher.js
+// src/delivery/http-dispatcher.mjs
 const MAX_RESPONSE_BYTES = 2048; // Exactly 2KB cap
 
-function executeDeliveryRequest(url, options) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(url, options, (res) => {
-      let bytesReceived = 0;
-      let bodyChunks = [];
-      let isTruncated = false;
+// Inside response stream listener:
+res.on('data', (chunk) => {
+  receivedBytes += chunk.length;
+  if (receivedBytes <= MAX_RESPONSE_BYTES) {
+    chunks.push(chunk);
+  } else {
+    isTruncated = true;
+    res.destroy(); // Sever connection immediately
+    settleResponse(); // Settle promise immediately without hanging
+  }
+});
 
-      res.on('data', (chunk) => {
-        bytesReceived += chunk.length;
-        if (bytesReceived <= MAX_RESPONSE_BYTES) {
-          bodyChunks.push(chunk);
-        } else {
-          isTruncated = true;
-          // DESTROY SOCKET IMMEDIATELY to prevent bandwidth/memory abuse
-          req.destroy(new Error('RESPONSE_SIZE_EXCEEDED_LIMIT'));
-        }
-      });
-
-      res.on('close', () => {
-        const bodyBuffer = Buffer.concat(bodyChunks);
-        resolve({
-          statusCode: res.statusCode,
-          bodyExcerpt: bodyBuffer.toString('utf8'),
-          truncated: isTruncated
-        });
-      });
-    });
-
-    req.on('error', reject);
-    req.write(options.payload);
-    req.end();
-  });
-}
+res.on('close', () => {
+  settleResponse();
+});
 ```
 
 ---
@@ -2918,6 +3024,10 @@ Content-Length: 412
   "status": "pending",
   "fencing_token": 16,
   "attempt_count": 15,
+  "epoch_id": "a953e5b9-1f4a-4e20-8012-70b92db632d4",
+  "epoch_attempt_count": 0,
+  "redrive_count": 1,
+  "horizon_started_at": "2026-10-28T08:00:00.000Z",
   "next_attempt_at": "2026-10-28T08:00:00.000Z",
   "redrive_audit_id": "e4b2d131-01f1-4db5-9e32-2d14b18c642e"
 }
@@ -2984,16 +3094,25 @@ The following architectural decisions cannot be settled purely from technical an
 - **Can Implementation Proceed?** **YES.** The codebase and schema are 100% identical under both profiles.
 
 ### Decision 2: Automated Provider API Reconciliation Credential Custody
-- **The Question:** Should CWIDS be granted API secret keys to query provider REST APIs directly during automated reconciliation, or should reconciliation remain strictly an external process owned by destination accounting backends?
-- **Impact:** Granting provider API keys to CWIDS expands its security blast radius; keeping reconciliation outside CWIDS requires applications to independently poll providers.
-- **Recommended Default:** CWIDS provides the scheduled reconciliation engine but restricts API query execution to read-only transaction lookup permissions.
-- **Can Implementation Proceed?** **YES.** Phase 1 implementation does not depend on provider API queries.
+- **Status:** **APPROVED DECISION.**
+- **Decision:** Support automated provider reconciliation as an optional, independently configurable CWIDS capability. Do not make it a mandatory dependency of core webhook ingestion or delivery.
+- **Implementation Requirements:**
+  1. Provider-specific adapters: Keep reconciliation logic behind provider-specific adapters.
+  2. Credential security: Use the narrowest permissions supported by each provider.
+  3. Independent operation: Outages in provider reconciliation APIs must never compromise core ingestion or delivery.
+  4. Bounded execution: Configurable concurrency, rate limiting, and backoff.
+  5. Trusted correlation: Use existing provider-connection and intent records; never trust unverified webhook payload fields for tenant ownership.
+  6. Discrepancy handling: Compare provider results with expected references, amounts, and currency. Record discrepancies for controlled review.
+  7. No silent business-state changes: Never rewrite immutable event history or bypass delivery states.
 
 ### Decision 3: Legal Data Retention Horizon for Encrypted Payloads
-- **The Question:** What is the legal retention period for raw encrypted webhook payloads? (Recommended: 30 days for raw payloads; 90 days for normalized metadata; 7 years for administrative audit events).
-- **Impact:** Directly drives storage disk sizing and automated batch cleanup schedules.
-- **Recommended Default:** Implement configurable retention settings with defaults: Payload = 30 days, Metadata = 90 days, Audits = 2,555 days (7 years).
-- **Can Implementation Proceed?** **YES.** Configurable values can be tuned via environment variables.
+- **Status:** **APPROVED DECISION & IMPLEMENTED.**
+- **Decision:** Implement configurable retention with safety guards:
+  - Raw encrypted payloads pruned after 30 days (`ENCRYPTED_PAYLOAD = NULL`, `PAYLOAD_DELETED_AT = CURRENT_TIMESTAMP`) unless flagged with `legal_hold = TRUE`.
+  - Normalized event metadata purged after 90 days for terminal deliveries without legal holds.
+  - **Forensic Retention Guards:** Unrouted events (`awaiting_route`) and quarantined events (`quarantined`) are strictly excluded from automated payload pruning and metadata purging to preserve forensic payloads.
+  - **Unrouted Operational Alerting:** Background worker scans for and alerts on unrouted/quarantined events older than 90 days.
+  - Administrative audit events retained by classification: 365 days for `operational`; 7 years (2,555 days) for `security` and `compliance`.
 
 ---
 
